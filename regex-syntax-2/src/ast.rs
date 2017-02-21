@@ -10,10 +10,11 @@
 
 use std::error;
 use std::fmt;
+use std::ops::Range;
 
 /// An error that occurred while parsing a regular expression into an abstract
 /// syntax tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstError {
     /// The span of this error.
     pub span: Span,
@@ -25,7 +26,10 @@ impl error::Error for AstError {
     fn description(&self) -> &str {
         use self::AstErrorKind::*;
         match self.kind {
-            UnrecognizedFlag(..) => "unrecognized flag",
+            FlagDuplicate{..} => "duplicate flag",
+            FlagRepeatedNegation{..} => "repeated negation",
+            FlagUnexpectedEof => "unexpected eof (flag)",
+            FlagUnrecognized{..} => "unrecognized flag",
         }
     }
 }
@@ -34,7 +38,16 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::AstErrorKind::*;
         match self.kind {
-            UnrecognizedFlag(flag) => {
+            FlagDuplicate { flag, .. } => {
+                write!(f, "duplicate flag '{}'", flag)
+            }
+            FlagRepeatedNegation{..} => {
+                write!(f, "flag negation operator repeated")
+            }
+            FlagUnexpectedEof => {
+                write!(f, "expected flag but got end of regex")
+            }
+            FlagUnrecognized { flag } => {
                 write!(f, "unrecognized flag '{}'", flag)
             }
         }
@@ -48,17 +61,36 @@ impl AstError {
 }
 
 /// The type of an error that occurred while building an AST.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstErrorKind {
+    /// A flag was used twice, e.g., `i-i`.
+    FlagDuplicate {
+        /// The duplicate flag.
+        flag: char,
+        /// The position of the original flag. The error position
+        /// points to the duplicate flag.
+        original: Span,
+    },
+    /// The negation operator was used twice, e.g., `-i-s`.
+    FlagRepeatedNegation {
+        /// The position of the original negation operator. The error position
+        /// points to the duplicate negation operator.
+        original: Span,
+    },
+    /// Expected a flag but got EOF, e.g., `(?`.
+    FlagUnexpectedEof,
     /// Unrecognized flag, e.g., `a`.
-    UnrecognizedFlag(char),
+    FlagUnrecognized {
+        /// The unrecognized flag.
+        flag: char,
+    },
 }
 
 /// Span represents the position information of a single AST item.
 ///
 /// All span positions are absolute byte offsets that can be used on the
 /// original regular expression that was parsed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Span {
     /// The start byte offset.
     pub start: usize,
@@ -66,11 +98,18 @@ pub struct Span {
     pub end: usize,
 }
 
+impl Span {
+    /// Create a new span with the given byte offset range.
+    pub fn new(range: Range<usize>) -> Span {
+        Span { start: range.start, end: range.end }
+    }
+}
+
 /// A comment from a regular expression with an associated span.
 ///
 /// A regular expression can only contain comments when the `x` flag is
 /// enabled.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Comment {
     /// The span of this comment, including the beginning `#`.
     pub span: Span,
@@ -84,7 +123,7 @@ pub struct Comment {
 /// Comments are not stored in the tree itself to avoid complexity. Each
 /// comment contains a span of precisely where it occurred in the original
 /// regular expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstWithComments {
     /// The actual ast.
     pub ast: Ast,
@@ -93,7 +132,7 @@ pub struct AstWithComments {
 }
 
 /// An abstract syntax tree for a single regular expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ast {
     /// An empty regex that matches exactly the empty string.
     EmptyString(Span),
@@ -134,7 +173,7 @@ impl Ast {
 }
 
 /// An alternation of regular expressions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstAlternation {
     /// The span of this alternation.
     pub span: Span,
@@ -143,7 +182,7 @@ pub struct AstAlternation {
 }
 
 /// A concatenation of regular expressions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstConcat {
     /// The span of this concatenation.
     pub span: Span,
@@ -156,7 +195,7 @@ pub struct AstConcat {
 /// A literal corresponds to a single Unicode scalar value. Literals may be
 /// represented in their literal form, e.g., `a` or in their escaped form,
 /// e.g., `\x61`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstLiteral {
     /// The span of this literal.
     pub span: Span,
@@ -167,7 +206,7 @@ pub struct AstLiteral {
 }
 
 /// The kind of a single literal expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstLiteralKind {
     /// The literal is written verbatim, e.g., `a` or `☃`.
     Verbatim,
@@ -186,7 +225,7 @@ pub enum AstLiteralKind {
 }
 
 /// A single character class expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClass {
     /// The special "any character" class, i.e., `.`.
     Dot(Span),
@@ -215,7 +254,7 @@ impl AstClass {
 }
 
 /// A Perl character class.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassPerl {
     /// The span of this class.
     pub span: Span,
@@ -227,7 +266,7 @@ pub struct AstClassPerl {
 }
 
 /// The available Perl character classes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClassPerlKind {
     /// Decimal numbers.
     Digit,
@@ -238,7 +277,7 @@ pub enum AstClassPerlKind {
 }
 
 /// An ASCII character class.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassAscii {
     /// The span of this class.
     pub span: Span,
@@ -250,7 +289,7 @@ pub struct AstClassAscii {
 }
 
 /// The available ASCII character classes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClassAsciiKind {
     /// `[0-9A-Za-z]`
     Alnum,
@@ -283,7 +322,7 @@ pub enum AstClassAsciiKind {
 }
 
 /// A Unicode character class.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassUnicode {
     /// The span of this class.
     pub span: Span,
@@ -295,7 +334,7 @@ pub struct AstClassUnicode {
 }
 
 /// The available forms of Unicode character classes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClassUnicodeKind {
     /// A one letter abbreviated class, e.g., `\pN`.
     OneLetter,
@@ -304,7 +343,7 @@ pub enum AstClassUnicodeKind {
 }
 
 /// A Unicode character class set, e.g., `[a-z0-9]`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassSet {
     /// The span of this class.
     pub span: Span,
@@ -316,7 +355,7 @@ pub struct AstClassSet {
 }
 
 /// A single component of a character class set.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClassSetItem {
     /// A single literal.
     Literal(AstLiteral),
@@ -341,7 +380,7 @@ impl AstClassSetItem {
 }
 
 /// A single character class range in a set.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassSetRange {
     /// The span of this range.
     pub span: Span,
@@ -352,7 +391,7 @@ pub struct AstClassSetRange {
 }
 
 /// A Unicode character class set operation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassSetOp {
     /// The span of this operation.
     pub span: Span,
@@ -369,7 +408,7 @@ pub struct AstClassSetOp {
 /// Note that this doesn't explicitly represent union since there is no
 /// explicit union operator. Concatenation inside a character class corresponds
 /// to the union operation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClassSetOpKind {
     /// The intersection of two sets, e.g., `\pN&&[a-z]`.
     Intersection,
@@ -382,7 +421,7 @@ pub enum AstClassSetOpKind {
 }
 
 /// A single zero-width assertion.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstAssertion {
     /// The span of this assertion.
     pub span: Span,
@@ -391,7 +430,7 @@ pub struct AstAssertion {
 }
 
 /// An assertion kind.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstAssertionKind {
     /// `^`
     StartLine,
@@ -408,7 +447,7 @@ pub enum AstAssertionKind {
 }
 
 /// A repetition operation applied to a regular expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstRepetition {
     /// The span of this operation.
     pub span: Span,
@@ -421,7 +460,7 @@ pub struct AstRepetition {
 }
 
 /// The kind of a repetition operator.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstRepetitionKind {
     /// `?`
     ZeroOrOne,
@@ -434,7 +473,7 @@ pub enum AstRepetitionKind {
 }
 
 /// A range repetition operator.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstRepetitionRange {
     /// `{m}`
     Exactly(u32),
@@ -450,7 +489,7 @@ pub enum AstRepetitionRange {
 /// include flag-only groups like `(?is)`, but does contain any group that
 /// contains a sub-expression, e.g., `(a)`, `(?P<name>a)`, `(?:a)` and
 /// `(?is:a)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstGroup {
     /// The span of this group.
     pub span: Span,
@@ -461,18 +500,27 @@ pub struct AstGroup {
 }
 
 /// The kind of a group.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstGroupKind {
     /// `(a)`
     CaptureIndex,
     /// `(?P<name>a)`
-    CaptureName(String),
+    CaptureName(AstCaptureName),
     /// `(?:a)` and `(?i:a)`
     NonCapturing(AstFlags),
 }
 
+/// A capture name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AstCaptureName {
+    /// The span of this capture name.
+    pub span: Span,
+    /// The capture name.
+    pub name: String,
+}
+
 /// A group of flags that is not applied to a particular regular expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstSetFlags {
     /// The span of these flags, including the grouping parentheses.
     pub span: Span,
@@ -483,7 +531,7 @@ pub struct AstSetFlags {
 /// A group of flags.
 ///
 /// This corresponds only to the sequence of flags themselves, e.g., `is-u`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstFlags {
     /// The span of this group of flags.
     pub span: Span,
@@ -492,8 +540,25 @@ pub struct AstFlags {
     pub items: Vec<AstFlagsItem>,
 }
 
+impl AstFlags {
+    /// Add the given item to this sequence of flags.
+    ///
+    /// If the item was added successfully, then `None` is returned. If the
+    /// given item is a duplicate, then `Some(i)` is returned, where
+    /// `items[i].kind == item.kind`.
+    pub fn add_item(&mut self, item: AstFlagsItem) -> Option<usize> {
+        for (i, x) in self.items.iter().enumerate() {
+            if x.kind == item.kind {
+                return Some(i);
+            }
+        }
+        self.items.push(item);
+        None
+    }
+}
+
 /// A single item in a group of flags.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstFlagsItem {
     /// The span of this item.
     pub span: Span,
@@ -502,7 +567,7 @@ pub struct AstFlagsItem {
 }
 
 /// The kind of an item in a group of flags.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstFlagsItemKind {
     /// A negation operator applied to all subsequent flags in the enclosing
     /// group.
@@ -512,7 +577,7 @@ pub enum AstFlagsItemKind {
 }
 
 /// A single flag.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstFlag {
     /// `i`
     CaseInsensitive,
@@ -526,4 +591,18 @@ pub enum AstFlag {
     Unicode,
     /// `x`
     IgnoreWhitespace,
+}
+
+impl fmt::Display for AstFlag {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::AstFlag::*;
+        match *self {
+            CaseInsensitive => write!(f, "i"),
+            MultiLine => write!(f, "m"),
+            DotMatchesNewLine => write!(f, "s"),
+            SwapGreed => write!(f, "U"),
+            Unicode => write!(f, "u"),
+            IgnoreWhitespace => write!(f, "x"),
+        }
+    }
 }
