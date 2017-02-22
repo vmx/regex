@@ -30,6 +30,9 @@ impl error::Error for AstError {
             FlagRepeatedNegation{..} => "repeated negation",
             FlagUnexpectedEof => "unexpected eof (flag)",
             FlagUnrecognized{..} => "unrecognized flag",
+            GroupEmpty => "empty group",
+            GroupUnclosed => "unclosed group",
+            GroupUnopened => "unopened group",
         }
     }
 }
@@ -49,6 +52,15 @@ impl fmt::Display for AstError {
             }
             FlagUnrecognized { flag } => {
                 write!(f, "unrecognized flag '{}'", flag)
+            }
+            GroupEmpty => {
+                write!(f, "empty group")
+            }
+            GroupUnclosed => {
+                write!(f, "unclosed group")
+            }
+            GroupUnopened => {
+                write!(f, "unopened group")
             }
         }
     }
@@ -84,6 +96,14 @@ pub enum AstErrorKind {
         /// The unrecognized flag.
         flag: char,
     },
+    /// An empty group, e.g., `()`.
+    GroupEmpty,
+    /// An unclosed group, e.g., `(ab`.
+    ///
+    /// The span of this error corresponds to the unclosed parenthesis.
+    GroupUnclosed,
+    /// An unopened group, e.g., `ab)`.
+    GroupUnopened,
 }
 
 /// Span represents the position information of a single AST item.
@@ -188,6 +208,21 @@ pub struct AstConcat {
     pub span: Span,
     /// The concatenation regular expressions.
     pub asts: Vec<Ast>,
+}
+
+impl AstConcat {
+    /// Return this concatenation as an AST.
+    ///
+    /// If this concatenation contains zero ASTs, then Ast::EmptyString is
+    /// returned. If this concatenation contains exactly 1 AST, then the
+    /// corresponding AST is returned. Otherwise, Ast::Concat is returned.
+    pub fn into_ast(mut self) -> Ast {
+        match self.asts.len() {
+            0 => Ast::EmptyString(self.span),
+            1 => self.asts.pop().unwrap(),
+            _ => Ast::Concat(self),
+        }
+    }
 }
 
 /// A single literal expression.

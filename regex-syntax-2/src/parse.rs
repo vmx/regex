@@ -1,9 +1,15 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::result;
 
 use ast::*;
 
 type Result<T> = result::Result<T, AstError>;
+
+#[derive(Debug)]
+enum Either<Left, Right> {
+    Left(Left),
+    Right(Right),
+}
 
 /// A regular expression parser.
 ///
@@ -14,12 +20,18 @@ pub struct Parser<'p> {
     pattern: &'p str,
     /// The current position of the parser.
     index: Cell<usize>,
+    /// A stack of sub-expressions.
+    stack: RefCell<Vec<Ast>>,
 }
 
 impl<'p> Parser<'p> {
     /// Create a new parser for the given regular expression.
     pub fn new(pattern: &str) -> Parser {
-        Parser { pattern: pattern, index: Cell::new(0) }
+        Parser {
+            pattern: pattern,
+            index: Cell::new(0),
+            stack: RefCell::new(vec![]),
+        }
     }
 
     /// Return the current position of the parser.
@@ -49,6 +61,19 @@ impl<'p> Parser<'p> {
         self.pattern[self.index.get()..].chars().next().is_some()
     }
 
+    /// If the substring starting at the current position of the parser has
+    /// the given prefix, then bump the parser to the character immediately
+    /// following the prefix and return true. Otherwise, don't bump the parser
+    /// and return false.
+    fn bump_if(&self, prefix: &str) -> bool {
+        if self.pattern[self.pos()..].starts_with(prefix) {
+            self.index.set(self.pos() + prefix.len());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Peek at the next character in the input without advancing the parser.
     ///
     /// If the input has been exhausted, then this returns `None`.
@@ -58,7 +83,7 @@ impl<'p> Parser<'p> {
 
     /// Returns true if the next call to `bump` would return false.
     fn is_eof(&self) -> bool {
-        self.peek().is_none()
+        self.pattern[self.pos()..].chars().next().is_none()
     }
 
     /// Create a span at the current position of the parser. Both the start
@@ -71,18 +96,121 @@ impl<'p> Parser<'p> {
     fn span_char(&self) -> Span {
         Span::new(self.pos()..self.pos() + self.char().len_utf8())
     }
+
+    /// Push an AST on to the parser's internal stack.
+    fn push(&self, x: Ast) {
+        self.stack.borrow_mut().push(x);
+    }
+
+    /// Pop an AST from the parser's internal stack.
+    ///
+    /// If the stack is empty, then `None` is returned.
+    fn pop(&self) -> Option<Ast> {
+        self.stack.borrow_mut().pop()
+    }
+
+    /// Pop a group AST from the parser's internal stack.
+    ///
+    /// If the group contains an alternation, then return that as well.
+    ///
+    /// If no such group could be popped, then an unopened group error is
+    /// returned.
+    fn pop_group(&self) -> Result<(AstGroup, Option<AstAlternation>)> {
+        match self.pop() {
+            Some(Ast::Group(group)) => return Ok((group, None)),
+            Some(Ast::Alternation(alt)) => {
+                match self.pop() {
+                    Some(Ast::Group(group)) => {
+                        return Ok((group, Some(alt)));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Err(AstError {
+            span: self.span_char(),
+            kind: AstErrorKind::GroupUnopened,
+        })
+    }
 }
 
 impl<'s> Parser<'s> {
+    /// Parse the regular expression.
+    fn parse(&self) -> Result<Ast> {
+        if self.is_eof() {
+            return Ok(Ast::EmptyString(self.span()));
+        }
+        Ok(try!(self.parse_concat()).into_ast())
+    }
+
+    fn parse_concat(&self) -> Result<AstConcat> {
+        let mut concat = AstConcat {
+            span: self.span(),
+            asts: vec![],
+        };
+        loop {
+            match self.char() {
+                '(' => {
+                    let sub_span = self.span();
+                    match try!(self.parse_group()) {
+                        Either::Left(set) => {
+                            concat.asts.push(Ast::Flags(set));
+                        }
+                        Either::Right(group) => {
+                            self.push(Ast::Concat(concat));
+                            self.push(Ast::Group(group));
+                            concat = AstConcat {
+                                span: sub_span,
+                                asts: vec![],
+                            };
+                        }
+                    }
+                }
+                ')' => {
+                    let (mut group, alt) = try!(self.pop_group());
+                    concat.span.end = self.pos();
+                    group.span.end = self.span_char().end;
+                    if concat.asts.is_empty() {
+                        return Err(AstError {
+                            span: group.span,
+                            kind: AstErrorKind::GroupEmpty,
+                        });
+                    }
+
+                    if let Some(mut alt) = alt {
+                        alt.asts.push(Ast::Concat(concat));
+                        group.ast = Box::new(Ast::Alternation(alt));
+                    } else {
+                        group.ast = Box::new(Ast::Concat(concat));
+                    }
+                    match self.pop() {
+                        Some(Ast::Concat(up_concat)) => {
+                            concat = up_concat;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            if !self.bump() {
+                break;
+            }
+        }
+        concat.span.end = self.pos();
+        Ok(concat)
+    }
+
     /// Parse a group (which contains a sub-expression) or a set of flags.
     ///
-    /// If a group was found, then it is pushed on to the parser's stack and
-    /// `Ok(None)` is returned. If a set of flags is found, then that set
-    /// is returned.
+    /// If a group was found, then it is returned with an empty AST. If a set
+    /// of flags is found, then that set is returned.
     ///
-    /// This advances the parser to the first character in the sub-expression
-    /// (in the case of a group) or to the character immediately following the
-    /// set of flags.
+    /// The parser should be positioned at the opening parenthesis.
+    ///
+    /// This advances the parser to the character before the start of the
+    /// sub-expression (in the case of a group) or to the closing parenthesis
+    /// immediately following the set of flags.
     ///
     /// # Errors
     ///
@@ -91,7 +219,43 @@ impl<'s> Parser<'s> {
     ///
     /// If a capture name is given and it is incorrectly specified, then a
     /// corresponding error is returned.
-    fn parse_group(&mut self) -> Result<Option<AstSetFlags>> {
+    fn parse_group(&self) -> Result<Either<AstSetFlags, AstGroup>> {
+        let open_span = self.span_char();
+        if self.bump_if("(?P<") {
+            let cap = try!(self.parse_capture_name());
+            Ok(Either::Right(AstGroup {
+                span: open_span,
+                kind: AstGroupKind::CaptureName(cap),
+                ast: Box::new(Ast::EmptyString(self.span())),
+            }))
+        } else if self.bump_if("(?") {
+            let flags = try!(self.parse_flags());
+            match self.char() {
+                ')' => {
+                    Ok(Either::Left(AstSetFlags {
+                        span: Span { end: self.span_char().end, ..open_span },
+                        flags: flags,
+                    }))
+                }
+                ':' => {
+                    Ok(Either::Right(AstGroup {
+                        span: open_span,
+                        kind: AstGroupKind::NonCapturing(flags),
+                        ast: Box::new(Ast::EmptyString(self.span())),
+                    }))
+                }
+                _ => unreachable!()
+            }
+        } else {
+            Ok(Either::Right(AstGroup {
+                span: open_span,
+                kind: AstGroupKind::CaptureIndex,
+                ast: Box::new(Ast::EmptyString(self.span())),
+            }))
+        }
+    }
+
+    fn parse_capture_name(&self) -> Result<AstCaptureName> {
         unimplemented!()
     }
 
@@ -184,6 +348,65 @@ mod tests {
 
     fn parser(pattern: &str) -> Parser {
         Parser::new(pattern)
+    }
+
+    #[test]
+    fn parse_group() {
+        assert_eq!(parser("(?i)").parse(), Ok(Ast::Flags(AstSetFlags {
+            span: Span::new(0..4),
+            flags: AstFlags {
+                span: Span::new(2..3),
+                items: vec![AstFlagsItem {
+                    span: Span::new(2..3),
+                    kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                }],
+            },
+        })));
+        assert_eq!(parser("(?iU)").parse(), Ok(Ast::Flags(AstSetFlags {
+            span: Span::new(0..5),
+            flags: AstFlags {
+                span: Span::new(2..4),
+                items: vec![
+                    AstFlagsItem {
+                        span: Span::new(2..3),
+                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    },
+                    AstFlagsItem {
+                        span: Span::new(3..4),
+                        kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                    },
+                ],
+            },
+        })));
+        assert_eq!(parser("(?i-U)").parse(), Ok(Ast::Flags(AstSetFlags {
+            span: Span::new(0..6),
+            flags: AstFlags {
+                span: Span::new(2..5),
+                items: vec![
+                    AstFlagsItem {
+                        span: Span::new(2..3),
+                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    },
+                    AstFlagsItem {
+                        span: Span::new(3..4),
+                        kind: AstFlagsItemKind::Negation,
+                    },
+                    AstFlagsItem {
+                        span: Span::new(4..5),
+                        kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                    },
+                ],
+            },
+        })));
+
+        assert_eq!(parser(")").parse(), Err(AstError {
+            span: Span::new(0..1),
+            kind: AstErrorKind::GroupUnopened,
+        }));
+        assert_eq!(parser("()").parse(), Err(AstError {
+            span: Span::new(0..2),
+            kind: AstErrorKind::GroupEmpty,
+        }));
     }
 
     #[test]
