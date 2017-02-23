@@ -21,7 +21,22 @@ pub struct Parser<'p> {
     /// The current position of the parser.
     index: Cell<usize>,
     /// A stack of sub-expressions.
-    stack: RefCell<Vec<Ast>>,
+    stack: RefCell<Vec<State>>,
+}
+
+enum State {
+    /// This state is pushed whenever an opening group is found.
+    Group {
+        /// The concatenation immediately preceding the opening group.
+        concat: AstConcat,
+        /// The group that has been opened. Its sub-AST is always empty.
+        group: AstGroup,
+    },
+    /// This state is pushed whenever a new alternation branch is found. If
+    /// an alternation branch is found and this state is at the top of the
+    /// stack, then this state should be modified to include the new
+    /// alternation.
+    Alternation(AstAlternation),
 }
 
 impl<'p> Parser<'p> {
@@ -98,40 +113,120 @@ impl<'p> Parser<'p> {
     }
 
     /// Push an AST on to the parser's internal stack.
-    fn push(&self, x: Ast) {
+    fn state_push(&self, x: State) {
         self.stack.borrow_mut().push(x);
     }
 
     /// Pop an AST from the parser's internal stack.
     ///
     /// If the stack is empty, then `None` is returned.
-    fn pop(&self) -> Option<Ast> {
+    fn state_pop(&self) -> Option<State> {
         self.stack.borrow_mut().pop()
     }
 
-    /// Pop a group AST from the parser's internal stack.
+    /// Parse and push a group AST (and its parent concatenation) on to the
+    /// parser's internal stack. Return a fresh concatenation corresponding
+    /// to the group's sub-AST.
     ///
-    /// If the group contains an alternation, then return that as well.
+    /// If a set of flags was found (with no group), then the concatenation
+    /// is returned with that set of flags added.
+    ///
+    /// This assumes that the parser is currently positioned on the opening
+    /// parenthesis. It advances the parser to the character before the start
+    /// of the sub-expression (or adjoining expression).
+    ///
+    /// If there was a problem parsing the start of the group, then an error
+    /// is returned.
+    fn push_group(&self, mut concat: AstConcat) -> Result<AstConcat> {
+        match try!(self.parse_group()) {
+            Either::Left(set) => {
+                concat.asts.push(Ast::Flags(set));
+                Ok(concat)
+            }
+            Either::Right(group) => {
+                self.state_push(State::Group {
+                    concat: concat,
+                    group: group,
+                });
+                // We want our span for the group's AST to start at the first
+                // possible position of its sub-expression, which is at the
+                // end of the current character.
+                let start = self.span_char().end;
+                Ok(AstConcat {
+                    span: Span::new(start..start),
+                    asts: vec![],
+                })
+            }
+        }
+    }
+
+    /// Pop a group AST from the parser's internal stack and set the group's
+    /// AST to the given concatenation. Return the concatenation containing
+    /// the group.
+    ///
+    /// This assumes that the parser is currently positioned on the closing
+    /// parenthesis and does not advance the parser.
     ///
     /// If no such group could be popped, then an unopened group error is
     /// returned.
-    fn pop_group(&self) -> Result<(AstGroup, Option<AstAlternation>)> {
-        match self.pop() {
-            Some(Ast::Group(group)) => return Ok((group, None)),
-            Some(Ast::Alternation(alt)) => {
-                match self.pop() {
-                    Some(Ast::Group(group)) => {
-                        return Ok((group, Some(alt)));
-                    }
-                    _ => {}
+    fn pop_group(&self, mut group_concat: AstConcat) -> Result<AstConcat> {
+        let (mut prior_concat, mut group, alt) =
+            match self.state_pop() {
+                Some(State::Group { concat, group }) => {
+                    (concat, group, None)
                 }
+                Some(State::Alternation(alt)) => {
+                    match self.state_pop() {
+                        Some(State::Group { concat, group }) => {
+                            (concat, group, Some(alt))
+                        }
+                        _ => return Err(AstError {
+                            span: self.span_char(),
+                            kind: AstErrorKind::GroupUnopened,
+                        }),
+                    }
+                }
+                _ => return Err(AstError {
+                    span: self.span_char(),
+                    kind: AstErrorKind::GroupUnopened,
+                }),
+            };
+        group_concat.span.end = self.pos();
+        group.span.end = self.span_char().end;
+        match alt {
+            Some(mut alt) => {
+                alt.asts.push(group_concat.into_ast());
+                group.ast = Box::new(alt.into_ast());
             }
-            _ => {}
+            None => {
+                group.ast = Box::new(group_concat.into_ast());
+            }
         }
-        Err(AstError {
-            span: self.span_char(),
-            kind: AstErrorKind::GroupUnopened,
-        })
+        prior_concat.asts.push(Ast::Group(group));
+        Ok(prior_concat)
+    }
+
+    /// Pop the last state from the parser's internal stack, if it exists, and
+    /// add the given concatenation to it. There either must be no state or a
+    /// single alternation item on the stack. Any other scenario produces an
+    /// error.
+    ///
+    /// This assumes that the parser has advanced to the end.
+    fn pop_end(&self, mut concat: AstConcat) -> Result<Ast> {
+        concat.span.end = self.pos();
+        match self.state_pop() {
+            None => Ok(concat.into_ast()),
+            Some(State::Alternation(mut alt)) => {
+                alt.asts.push(concat.into_ast());
+                Ok(Ast::Alternation(alt))
+            }
+            Some(State::Group { group, .. }) => {
+                Err(AstError {
+                    span: group.span,
+                    kind: AstErrorKind::GroupUnclosed,
+                })
+            }
+        }
     }
 }
 
@@ -141,64 +236,21 @@ impl<'s> Parser<'s> {
         if self.is_eof() {
             return Ok(Ast::EmptyString(self.span()));
         }
-        Ok(try!(self.parse_concat()).into_ast())
-    }
-
-    fn parse_concat(&self) -> Result<AstConcat> {
         let mut concat = AstConcat {
             span: self.span(),
             asts: vec![],
         };
         loop {
             match self.char() {
-                '(' => {
-                    let sub_span = self.span();
-                    match try!(self.parse_group()) {
-                        Either::Left(set) => {
-                            concat.asts.push(Ast::Flags(set));
-                        }
-                        Either::Right(group) => {
-                            self.push(Ast::Concat(concat));
-                            self.push(Ast::Group(group));
-                            concat = AstConcat {
-                                span: sub_span,
-                                asts: vec![],
-                            };
-                        }
-                    }
-                }
-                ')' => {
-                    let (mut group, alt) = try!(self.pop_group());
-                    concat.span.end = self.pos();
-                    group.span.end = self.span_char().end;
-                    if concat.asts.is_empty() {
-                        return Err(AstError {
-                            span: group.span,
-                            kind: AstErrorKind::GroupEmpty,
-                        });
-                    }
-
-                    if let Some(mut alt) = alt {
-                        alt.asts.push(Ast::Concat(concat));
-                        group.ast = Box::new(Ast::Alternation(alt));
-                    } else {
-                        group.ast = Box::new(Ast::Concat(concat));
-                    }
-                    match self.pop() {
-                        Some(Ast::Concat(up_concat)) => {
-                            concat = up_concat;
-                        }
-                        _ => unreachable!(),
-                    }
-                }
+                '(' => concat = try!(self.push_group(concat)),
+                ')' => concat = try!(self.pop_group(concat)),
                 _ => unreachable!(),
             }
             if !self.bump() {
                 break;
             }
         }
-        concat.span.end = self.pos();
-        Ok(concat)
+        self.pop_end(concat)
     }
 
     /// Parse a group (which contains a sub-expression) or a set of flags.
@@ -250,7 +302,10 @@ impl<'s> Parser<'s> {
             Ok(Either::Right(AstGroup {
                 span: open_span,
                 kind: AstGroupKind::CaptureIndex,
-                ast: Box::new(Ast::EmptyString(self.span())),
+                ast: Box::new(Ast::EmptyString(Span {
+                    start: self.span_char().end,
+                    end: self.span_char().end,
+                })),
             }))
         }
     }
@@ -399,13 +454,32 @@ mod tests {
             },
         })));
 
+        assert_eq!(parser("()").parse(), Ok(Ast::Group(AstGroup {
+            span: Span::new(0..2),
+            kind: AstGroupKind::CaptureIndex,
+            ast: Box::new(Ast::EmptyString(Span::new(1..1))),
+        })));
+        assert_eq!(parser("(())").parse(), Ok(Ast::Group(AstGroup {
+            span: Span::new(0..4),
+            kind: AstGroupKind::CaptureIndex,
+            ast: Box::new(Ast::Group(AstGroup {
+                span: Span::new(1..3),
+                kind: AstGroupKind::CaptureIndex,
+                ast: Box::new(Ast::EmptyString(Span::new(2..2))),
+            })),
+        })));
+
+        assert_eq!(parser("(").parse(), Err(AstError {
+            span: Span::new(0..1),
+            kind: AstErrorKind::GroupUnclosed,
+        }));
+        assert_eq!(parser("(()").parse(), Err(AstError {
+            span: Span::new(0..1),
+            kind: AstErrorKind::GroupUnclosed,
+        }));
         assert_eq!(parser(")").parse(), Err(AstError {
             span: Span::new(0..1),
             kind: AstErrorKind::GroupUnopened,
-        }));
-        assert_eq!(parser("()").parse(), Err(AstError {
-            span: Span::new(0..2),
-            kind: AstErrorKind::GroupEmpty,
         }));
     }
 

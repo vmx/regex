@@ -201,6 +201,21 @@ pub struct AstAlternation {
     pub asts: Vec<Ast>,
 }
 
+impl AstAlternation {
+    /// Return this alternation as an AST.
+    ///
+    /// If this alternation contains zero ASTs, then Ast::EmptyString is
+    /// returned. If this alternation contains exactly 1 AST, then the
+    /// corresponding AST is returned. Otherwise, Ast::Alternation is returned.
+    pub fn into_ast(mut self) -> Ast {
+        match self.asts.len() {
+            0 => Ast::EmptyString(self.span),
+            1 => self.asts.pop().unwrap(),
+            _ => Ast::Alternation(self),
+        }
+    }
+}
+
 /// A concatenation of regular expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstConcat {
