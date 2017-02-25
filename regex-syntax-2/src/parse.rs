@@ -531,6 +531,24 @@ impl<'s> Parser<'s> {
             });
         }
         let c = self.char();
+        // Put some of the more complicated routines into helpers.
+        match c {
+            '0'...'7' => {
+                return self.parse_octal().map(Primitive::Literal);
+            }
+            'x' => {
+                return self.parse_hex().map(Primitive::Literal);
+            }
+            'p' | 'P' => {
+                return self.parse_unicode_class().map(Primitive::Unicode);
+            }
+            'd' | 's' | 'w' | 'D' | 'S' | 'W' => {
+                return self.parse_perl_class().map(Primitive::Perl);
+            }
+            _ => {}
+        }
+
+        // Handle all of the one letter sequences inline.
         self.bump();
         let span_end = span_start.with_end(self.pos());
         if is_punct(c) {
@@ -560,11 +578,35 @@ impl<'s> Parser<'s> {
                 span: span_end,
                 kind: AstAssertionKind::EndText,
             })),
+            'b' => Ok(Primitive::Assertion(AstAssertion {
+                span: span_end,
+                kind: AstAssertionKind::WordBoundary,
+            })),
+            'B' => Ok(Primitive::Assertion(AstAssertion {
+                span: span_end,
+                kind: AstAssertionKind::NotWordBoundary,
+            })),
             c => Err(AstError {
                 span: span_end,
                 kind: AstErrorKind::EscapeUnrecognized { c: c },
             }),
         }
+    }
+
+    fn parse_octal(&self) -> Result<AstLiteral> {
+        unimplemented!()
+    }
+
+    fn parse_hex(&self) -> Result<AstLiteral> {
+        unimplemented!()
+    }
+
+    fn parse_unicode_class(&self) -> Result<AstClassUnicode> {
+        unimplemented!()
+    }
+
+    fn parse_perl_class(&self) -> Result<AstClassPerl> {
+        unimplemented!()
     }
 }
 
