@@ -10,7 +10,6 @@
 
 use std::error;
 use std::fmt;
-use std::ops::Range;
 
 /// An error that occurred while parsing a regular expression into an abstract
 /// syntax tree.
@@ -26,6 +25,8 @@ impl error::Error for AstError {
     fn description(&self) -> &str {
         use self::AstErrorKind::*;
         match self.kind {
+            EscapeUnexpectedEof => "unexpected eof (escape sequence)",
+            EscapeUnrecognized{..} => "unrecognized escape sequence",
             FlagDuplicate{..} => "duplicate flag",
             FlagRepeatedNegation{..} => "repeated negation",
             FlagUnexpectedEof => "unexpected eof (flag)",
@@ -41,6 +42,13 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::AstErrorKind::*;
         match self.kind {
+            EscapeUnexpectedEof => {
+                write!(f, "incomplete escape sequence, \
+                           reached end of pattern prematurely")
+            }
+            EscapeUnrecognized { c } => {
+                write!(f, "unrecognized escape sequence '\\{}'", c)
+            }
             FlagDuplicate { flag, .. } => {
                 write!(f, "duplicate flag '{}'", flag)
             }
@@ -75,6 +83,13 @@ impl AstError {
 /// The type of an error that occurred while building an AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstErrorKind {
+    /// EOF was found before an escape sequence was completed.
+    EscapeUnexpectedEof,
+    /// An unrecognized escape sequence.
+    EscapeUnrecognized {
+        /// The unrecognized escape.
+        c: char,
+    },
     /// A flag was used twice, e.g., `i-i`.
     FlagDuplicate {
         /// The duplicate flag.
@@ -113,28 +128,58 @@ pub enum AstErrorKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Span {
     /// The start byte offset.
-    pub start: usize,
+    pub start: Position,
     /// The end byte offset.
-    pub end: usize,
+    pub end: Position,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Position {
+    /// The absolute offset of this position, starting at `0` from the
+    /// beginning of the regular expression pattern string.
+    pub offset: usize,
+    /// The line number, starting at `1`.
+    pub line: usize,
+    /// The approximate column number, starting at `1`.
+    pub column: usize,
 }
 
 impl Span {
-    /// Create a new span with the given byte offset range.
-    pub fn new(range: Range<usize>) -> Span {
-        Span { start: range.start, end: range.end }
+    /// Create a new span with the given positions.
+    pub fn new(start: Position, end: Position) -> Span {
+        Span { start: start, end: end }
+    }
+
+    /// Create a new span using the given position as the start and end.
+    pub fn splat(pos: Position) -> Span {
+        Span::new(pos, pos)
+    }
+
+    /// Create a new span by replacing the starting the position with the one
+    /// given.
+    pub fn with_start(self, pos: Position) -> Span {
+        Span { start: pos, ..self }
+    }
+
+    /// Create a new span by replacing the ending the position with the one
+    /// given.
+    pub fn with_end(self, pos: Position) -> Span {
+        Span { end: pos, ..self }
     }
 }
 
-/// A comment from a regular expression with an associated span.
-///
-/// A regular expression can only contain comments when the `x` flag is
-/// enabled.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Comment {
-    /// The span of this comment, including the beginning `#`.
-    pub span: Span,
-    /// The comment text, starting with the first character following the `#`.
-    pub comment: String,
+impl Position {
+    /// Create a new position with the given information.
+    ///
+    /// `offset` is the absolute offset of the position, starting at `0` from
+    /// the beginning of the regular expression pattern string.
+    ///
+    /// `line` is the line number, starting at `1`.
+    ///
+    /// `column` is the approximate column number, starting at `1`.
+    pub fn new(offset: usize, line: usize, column: usize) -> Position {
+        Position { offset: offset, line: line, column: column }
+    }
 }
 
 /// An abstract syntax tree for a singular expression along with comments
@@ -148,14 +193,26 @@ pub struct AstWithComments {
     /// The actual ast.
     pub ast: Ast,
     /// All comments found in the original regular expression.
-    pub comments: Vec<Comment>,
+    pub comments: Vec<AstComment>,
+}
+
+/// A comment from a regular expression with an associated span.
+///
+/// A regular expression can only contain comments when the `x` flag is
+/// enabled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AstComment {
+    /// The span of this comment, including the beginning `#`.
+    pub span: Span,
+    /// The comment text, starting with the first character following the `#`.
+    pub comment: String,
 }
 
 /// An abstract syntax tree for a single regular expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ast {
     /// An empty regex that matches exactly the empty string.
-    EmptyString(Span),
+    Empty(Span),
     /// A single character literal, which includes escape sequences.
     Literal(AstLiteral),
     /// A single character class. This includes all forms of character classes,
@@ -179,7 +236,7 @@ impl Ast {
     /// Return the span of this abstract syntax tree.
     pub fn span(&self) -> &Span {
         match *self {
-            Ast::EmptyString(ref span) => span,
+            Ast::Empty(ref span) => span,
             Ast::Literal(ref x) => &x.span,
             Ast::Class(ref x) => x.span(),
             Ast::Assertion(ref x) => &x.span,
@@ -204,12 +261,12 @@ pub struct AstAlternation {
 impl AstAlternation {
     /// Return this alternation as an AST.
     ///
-    /// If this alternation contains zero ASTs, then Ast::EmptyString is
+    /// If this alternation contains zero ASTs, then Ast::Empty is
     /// returned. If this alternation contains exactly 1 AST, then the
     /// corresponding AST is returned. Otherwise, Ast::Alternation is returned.
     pub fn into_ast(mut self) -> Ast {
         match self.asts.len() {
-            0 => Ast::EmptyString(self.span),
+            0 => Ast::Empty(self.span),
             1 => self.asts.pop().unwrap(),
             _ => Ast::Alternation(self),
         }
@@ -228,12 +285,12 @@ pub struct AstConcat {
 impl AstConcat {
     /// Return this concatenation as an AST.
     ///
-    /// If this concatenation contains zero ASTs, then Ast::EmptyString is
+    /// If this concatenation contains zero ASTs, then Ast::Empty is
     /// returned. If this concatenation contains exactly 1 AST, then the
     /// corresponding AST is returned. Otherwise, Ast::Concat is returned.
     pub fn into_ast(mut self) -> Ast {
         match self.asts.len() {
-            0 => Ast::EmptyString(self.span),
+            0 => Ast::Empty(self.span),
             1 => self.asts.pop().unwrap(),
             _ => Ast::Concat(self),
         }

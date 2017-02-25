@@ -5,10 +5,50 @@ use ast::*;
 
 type Result<T> = result::Result<T, AstError>;
 
-#[derive(Debug)]
+/// A simple binary sum type.
+///
+/// This is occasionally useful in the parser in an ad hoc fashion.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Either<Left, Right> {
     Left(Left),
     Right(Right),
+}
+
+/// A primitive is an expression with no sub-expressions. This includes
+/// literals, assertions and non-set character classes.
+///
+/// This does not include ASCII character classes, since they can only appear
+/// within a set character class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Primitive {
+    Literal(AstLiteral),
+    Assertion(AstAssertion),
+    Dot(Span),
+    Perl(AstClassPerl),
+    Unicode(AstClassUnicode),
+}
+
+impl Primitive {
+    fn into_ast(self) -> Ast {
+        match self {
+            Primitive::Literal(lit) => Ast::Literal(lit),
+            Primitive::Assertion(assert) => Ast::Assertion(assert),
+            Primitive::Dot(span) => Ast::Class(AstClass::Dot(span)),
+            Primitive::Perl(cls) => Ast::Class(AstClass::Perl(cls)),
+            Primitive::Unicode(cls) => Ast::Class(AstClass::Unicode(cls)),
+        }
+    }
+}
+
+/// Returns true if the give character has significance in a regex.
+///
+/// These are the only characters that are allowed to be escaped.
+fn is_punct(c: char) -> bool {
+    match c {
+        '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' |
+        '[' | ']' | '{' | '}' | '^' | '$' | '#' | '&' | '-' | '~' => true,
+        _ => false,
+    }
 }
 
 /// A regular expression parser.
@@ -19,7 +59,11 @@ pub struct Parser<'p> {
     /// The full regular expression provided by the user.
     pattern: &'p str,
     /// The current position of the parser.
-    index: Cell<usize>,
+    coffset: Cell<usize>,
+    /// The current line number of the parser.
+    cline: Cell<usize>,
+    /// The current column number of the parser.
+    ccolumn: Cell<usize>,
     /// A stack of sub-expressions.
     stack: RefCell<Vec<State>>,
 }
@@ -44,36 +88,62 @@ impl<'p> Parser<'p> {
     pub fn new(pattern: &str) -> Parser {
         Parser {
             pattern: pattern,
-            index: Cell::new(0),
+            coffset: Cell::new(0),
+            cline: Cell::new(1),
+            ccolumn: Cell::new(1),
             stack: RefCell::new(vec![]),
         }
     }
 
-    /// Return the current position of the parser.
-    fn pos(&self) -> usize {
-        self.index.get()
+    /// Return the current offset of the parser.
+    ///
+    /// The offset starts at `0` from the beginning of the regular expression
+    /// pattern string.
+    fn offset(&self) -> usize {
+        self.coffset.get()
+    }
+
+    /// Return the current line number of the parser.
+    ///
+    /// The line number starts at `1`.
+    fn line(&self) -> usize {
+        self.cline.get()
+    }
+
+    /// Return the current column of the parser.
+    ///
+    /// The column number starts at `1` and is reset whenever a `\n` is seen.
+    fn column(&self) -> usize {
+        self.ccolumn.get()
     }
 
     /// Return the character at the current position of the parser.
     ///
     /// This panics if the current position does not point to a valid char.
     fn char(&self) -> char {
-        self.char_at(self.pos())
+        self.char_at(self.offset())
     }
 
     /// Return the character at the given position.
     ///
     /// This panics if the given position does not point to a valid char.
     fn char_at(&self, i: usize) -> char {
-        self.pattern[i..].chars().next().unwrap()
+        self.pattern[i..].chars().next()
+            .expect(&format!("expected char at offset {}", i))
     }
 
     /// Bump the parser to the next Unicode scalar value.
     ///
     /// If the end of the input has been reached, then `false` is returned.
     fn bump(&self) -> bool {
-        self.index.set(self.pos() + self.char().len_utf8());
-        self.pattern[self.index.get()..].chars().next().is_some()
+        if self.char() == '\n' {
+            self.ccolumn.set(1);
+            self.cline.set(self.line().checked_add(1).unwrap());
+        } else {
+            self.ccolumn.set(self.column().checked_add(1).unwrap());
+        }
+        self.coffset.set(self.offset() + self.char().len_utf8());
+        self.pattern[self.coffset.get()..].chars().next().is_some()
     }
 
     /// If the substring starting at the current position of the parser has
@@ -81,8 +151,10 @@ impl<'p> Parser<'p> {
     /// following the prefix and return true. Otherwise, don't bump the parser
     /// and return false.
     fn bump_if(&self, prefix: &str) -> bool {
-        if self.pattern[self.pos()..].starts_with(prefix) {
-            self.index.set(self.pos() + prefix.len());
+        if self.pattern[self.offset()..].starts_with(prefix) {
+            for _ in 0..prefix.chars().count() {
+                assert!(self.bump());
+            }
             true
         } else {
             false
@@ -93,23 +165,34 @@ impl<'p> Parser<'p> {
     ///
     /// If the input has been exhausted, then this returns `None`.
     fn peek(&self) -> Option<char> {
-        self.pattern[self.pos() + self.char().len_utf8()..].chars().next()
+        self.pattern[self.offset() + self.char().len_utf8()..].chars().next()
     }
 
     /// Returns true if the next call to `bump` would return false.
     fn is_eof(&self) -> bool {
-        self.pattern[self.pos()..].chars().next().is_none()
+        self.offset() == self.pattern.len()
+    }
+
+    /// Return the current position of the parser, which includes the offset,
+    /// line and column.
+    fn pos(&self) -> Position {
+        Position::new(self.offset(), self.line(), self.column())
     }
 
     /// Create a span at the current position of the parser. Both the start
     /// and end of the span are set.
     fn span(&self) -> Span {
-        Span::new(self.pos()..self.pos())
+        Span::splat(self.pos())
     }
 
     /// Create a span that covers the current character.
     fn span_char(&self) -> Span {
-        Span::new(self.pos()..self.pos() + self.char().len_utf8())
+        let next = Position {
+            offset: self.offset().checked_add(self.char().len_utf8()).unwrap(),
+            line: self.line(),
+            column: self.column().checked_add(1).unwrap(),
+        };
+        Span::new(self.pos(), next)
     }
 
     /// Push an AST on to the parser's internal stack.
@@ -132,12 +215,13 @@ impl<'p> Parser<'p> {
     /// is returned with that set of flags added.
     ///
     /// This assumes that the parser is currently positioned on the opening
-    /// parenthesis. It advances the parser to the character before the start
+    /// parenthesis. It advances the parser to the character at the start
     /// of the sub-expression (or adjoining expression).
     ///
     /// If there was a problem parsing the start of the group, then an error
     /// is returned.
     fn push_group(&self, mut concat: AstConcat) -> Result<AstConcat> {
+        assert_eq!(self.char(), '(');
         match try!(self.parse_group()) {
             Either::Left(set) => {
                 concat.asts.push(Ast::Flags(set));
@@ -148,12 +232,8 @@ impl<'p> Parser<'p> {
                     concat: concat,
                     group: group,
                 });
-                // We want our span for the group's AST to start at the first
-                // possible position of its sub-expression, which is at the
-                // end of the current character.
-                let start = self.span_char().end;
                 Ok(AstConcat {
-                    span: Span::new(start..start),
+                    span: self.span(),
                     asts: vec![],
                 })
             }
@@ -165,11 +245,12 @@ impl<'p> Parser<'p> {
     /// the group.
     ///
     /// This assumes that the parser is currently positioned on the closing
-    /// parenthesis and does not advance the parser.
+    /// parenthesis and advances the parser to the character following the `)`.
     ///
     /// If no such group could be popped, then an unopened group error is
     /// returned.
     fn pop_group(&self, mut group_concat: AstConcat) -> Result<AstConcat> {
+        assert_eq!(self.char(), ')');
         let (mut prior_concat, mut group, alt) =
             match self.state_pop() {
                 Some(State::Group { concat, group }) => {
@@ -192,7 +273,8 @@ impl<'p> Parser<'p> {
                 }),
             };
         group_concat.span.end = self.pos();
-        group.span.end = self.span_char().end;
+        self.bump();
+        group.span.end = self.pos();
         match alt {
             Some(mut alt) => {
                 alt.asts.push(group_concat.into_ast());
@@ -234,20 +316,17 @@ impl<'s> Parser<'s> {
     /// Parse the regular expression.
     fn parse(&self) -> Result<Ast> {
         if self.is_eof() {
-            return Ok(Ast::EmptyString(self.span()));
+            return Ok(Ast::Empty(self.span()));
         }
         let mut concat = AstConcat {
             span: self.span(),
             asts: vec![],
         };
-        loop {
+        while !self.is_eof() {
             match self.char() {
                 '(' => concat = try!(self.push_group(concat)),
                 ')' => concat = try!(self.pop_group(concat)),
                 _ => unreachable!(),
-            }
-            if !self.bump() {
-                break;
             }
         }
         self.pop_end(concat)
@@ -278,34 +357,32 @@ impl<'s> Parser<'s> {
             Ok(Either::Right(AstGroup {
                 span: open_span,
                 kind: AstGroupKind::CaptureName(cap),
-                ast: Box::new(Ast::EmptyString(self.span())),
+                ast: Box::new(Ast::Empty(self.span())),
             }))
         } else if self.bump_if("(?") {
             let flags = try!(self.parse_flags());
-            match self.char() {
-                ')' => {
-                    Ok(Either::Left(AstSetFlags {
-                        span: Span { end: self.span_char().end, ..open_span },
-                        flags: flags,
-                    }))
-                }
-                ':' => {
-                    Ok(Either::Right(AstGroup {
-                        span: open_span,
-                        kind: AstGroupKind::NonCapturing(flags),
-                        ast: Box::new(Ast::EmptyString(self.span())),
-                    }))
-                }
-                _ => unreachable!()
+            let char_end = self.char();
+            self.bump();
+            if char_end == ')' {
+                Ok(Either::Left(AstSetFlags {
+                    span: Span { end: self.pos(), ..open_span },
+                    flags: flags,
+                }))
+            } else {
+                assert_eq!(char_end, ':');
+                Ok(Either::Right(AstGroup {
+                    span: open_span,
+                    kind: AstGroupKind::NonCapturing(flags),
+                    ast: Box::new(Ast::Empty(self.span())),
+                }))
             }
         } else {
+            assert_eq!(self.char(), '(');
+            self.bump();
             Ok(Either::Right(AstGroup {
                 span: open_span,
                 kind: AstGroupKind::CaptureIndex,
-                ast: Box::new(Ast::EmptyString(Span {
-                    start: self.span_char().end,
-                    end: self.span_char().end,
-                })),
+                ast: Box::new(Ast::Empty(self.span())),
             }))
         }
     }
@@ -317,7 +394,7 @@ impl<'s> Parser<'s> {
     /// Parse a sequence of flags starting at the current character.
     ///
     /// This advances the parser to the character immediately following the
-    /// final flag in the set.
+    /// flags, which is guaranteed to be either `:` or `)`.
     ///
     /// # Errors
     ///
@@ -370,12 +447,10 @@ impl<'s> Parser<'s> {
             }
         }
         flags.span.end = self.pos();
-        return Ok(flags);
+        Ok(flags)
     }
 
-    /// Parse the current character as a flag.
-    ///
-    /// This does not advance the parser.
+    /// Parse the current character as a flag. Do not advance the parser.
     ///
     /// # Errors
     ///
@@ -394,60 +469,180 @@ impl<'s> Parser<'s> {
             }),
         }
     }
+
+    /// Parse a primitive AST. e.g., A literal, non-set character class or
+    /// assertion.
+    ///
+    /// This assumes that the parser expects a primitive at the current
+    /// location. i.e., All other non-primitive cases have been handled.
+    /// For example, if the parser's position is at `|`, then `|` will be
+    /// treated as a literal (e.g., inside a character class).
+    ///
+    /// This advances the parser to the first character immediately following
+    /// the primitive.
+    fn parse_primitive(&self) -> Result<Primitive> {
+        match self.char() {
+            '\\' => self.parse_escape(),
+            '.' => {
+                let ast = Primitive::Dot(self.span_char());
+                self.bump();
+                Ok(ast)
+            }
+            '^' => {
+                let ast = Primitive::Assertion(AstAssertion {
+                    span: self.span_char(),
+                    kind: AstAssertionKind::StartLine,
+                });
+                self.bump();
+                Ok(ast)
+            }
+            '$' => {
+                let ast = Primitive::Assertion(AstAssertion {
+                    span: self.span_char(),
+                    kind: AstAssertionKind::EndLine,
+                });
+                self.bump();
+                Ok(ast)
+            }
+            c => {
+                let ast = Primitive::Literal(AstLiteral {
+                    span: self.span_char(),
+                    kind: AstLiteralKind::Verbatim,
+                    c: c,
+                });
+                self.bump();
+                Ok(ast)
+            }
+        }
+    }
+
+    /// Parse an escape sequence as a primitive AST.
+    ///
+    /// This assumes the parser is positioned at the start of the escape
+    /// sequence, i.e., `\`. It advances the parser to the first character
+    /// immediately following the escape sequence.
+    fn parse_escape(&self) -> Result<Primitive> {
+        assert_eq!(self.char(), '\\');
+        let span_start = self.span();
+        if !self.bump() {
+            return Err(AstError {
+                span: span_start.with_end(self.pos()),
+                kind: AstErrorKind::EscapeUnexpectedEof,
+            });
+        }
+        let c = self.char();
+        self.bump();
+        let span_end = span_start.with_end(self.pos());
+        if is_punct(c) {
+            return Ok(Primitive::Literal(AstLiteral {
+                span: span_end,
+                kind: AstLiteralKind::Punctuation,
+                c: c,
+            }));
+        }
+        let special = |c| Ok(Primitive::Literal(AstLiteral {
+            span: span_end,
+            kind: AstLiteralKind::Special,
+            c: c,
+        }));
+        match c {
+            'a' => special('\x07'),
+            'f' => special('\x0C'),
+            't' => special('\t'),
+            'n' => special('\n'),
+            'r' => special('\r'),
+            'v' => special('\x0B'),
+            'A' => Ok(Primitive::Assertion(AstAssertion {
+                span: span_end,
+                kind: AstAssertionKind::StartText,
+            })),
+            'z' => Ok(Primitive::Assertion(AstAssertion {
+                span: span_end,
+                kind: AstAssertionKind::EndText,
+            })),
+            c => Err(AstError {
+                span: span_end,
+                kind: AstErrorKind::EscapeUnrecognized { c: c },
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use ast::*;
-    use super::Parser;
+    use super::{Parser, Primitive};
 
     fn parser(pattern: &str) -> Parser {
         Parser::new(pattern)
     }
 
+    /// Create a new span from the given offset range. This assumes a single
+    /// line and sets the columns based on the offsets. i.e., This only works
+    /// out of the box for ASCII, which is fine for most tests.
+    fn span(range: Range<usize>) -> Span {
+        let start = Position::new(range.start, 1, range.start + 1);
+        let end = Position::new(range.end, 1, range.end + 1);
+        Span::new(start, end)
+    }
+
+    /// Create a new span starting at the given offset/column and ending where
+    /// the given string ends.
+    fn span_with(start: usize, ending_at: &str) -> Span {
+        let start = Position::new(start, 1, start + 1);
+        let end = Position {
+            offset: start.offset + ending_at.len(),
+            line: start.line + ending_at.matches('\n').count(),
+            column: start.column + ending_at.chars().count(),
+        };
+        Span::new(start, end)
+    }
+
     #[test]
     fn parse_group() {
         assert_eq!(parser("(?i)").parse(), Ok(Ast::Flags(AstSetFlags {
-            span: Span::new(0..4),
+            span: span(0..4),
             flags: AstFlags {
-                span: Span::new(2..3),
+                span: span(2..3),
                 items: vec![AstFlagsItem {
-                    span: Span::new(2..3),
+                    span: span(2..3),
                     kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
                 }],
             },
         })));
         assert_eq!(parser("(?iU)").parse(), Ok(Ast::Flags(AstSetFlags {
-            span: Span::new(0..5),
+            span: span(0..5),
             flags: AstFlags {
-                span: Span::new(2..4),
+                span: span(2..4),
                 items: vec![
                     AstFlagsItem {
-                        span: Span::new(2..3),
+                        span: span(2..3),
                         kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
                     },
                     AstFlagsItem {
-                        span: Span::new(3..4),
+                        span: span(3..4),
                         kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
                     },
                 ],
             },
         })));
         assert_eq!(parser("(?i-U)").parse(), Ok(Ast::Flags(AstSetFlags {
-            span: Span::new(0..6),
+            span: span(0..6),
             flags: AstFlags {
-                span: Span::new(2..5),
+                span: span(2..5),
                 items: vec![
                     AstFlagsItem {
-                        span: Span::new(2..3),
+                        span: span(2..3),
                         kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
                     },
                     AstFlagsItem {
-                        span: Span::new(3..4),
+                        span: span(3..4),
                         kind: AstFlagsItemKind::Negation,
                     },
                     AstFlagsItem {
-                        span: Span::new(4..5),
+                        span: span(4..5),
                         kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
                     },
                 ],
@@ -455,30 +650,30 @@ mod tests {
         })));
 
         assert_eq!(parser("()").parse(), Ok(Ast::Group(AstGroup {
-            span: Span::new(0..2),
+            span: span(0..2),
             kind: AstGroupKind::CaptureIndex,
-            ast: Box::new(Ast::EmptyString(Span::new(1..1))),
+            ast: Box::new(Ast::Empty(span(1..1))),
         })));
         assert_eq!(parser("(())").parse(), Ok(Ast::Group(AstGroup {
-            span: Span::new(0..4),
+            span: span(0..4),
             kind: AstGroupKind::CaptureIndex,
             ast: Box::new(Ast::Group(AstGroup {
-                span: Span::new(1..3),
+                span: span(1..3),
                 kind: AstGroupKind::CaptureIndex,
-                ast: Box::new(Ast::EmptyString(Span::new(2..2))),
+                ast: Box::new(Ast::Empty(span(2..2))),
             })),
         })));
 
         assert_eq!(parser("(").parse(), Err(AstError {
-            span: Span::new(0..1),
+            span: span(0..1),
             kind: AstErrorKind::GroupUnclosed,
         }));
         assert_eq!(parser("(()").parse(), Err(AstError {
-            span: Span::new(0..1),
+            span: span(0..1),
             kind: AstErrorKind::GroupUnclosed,
         }));
         assert_eq!(parser(")").parse(), Err(AstError {
-            span: Span::new(0..1),
+            span: span(0..1),
             kind: AstErrorKind::GroupUnopened,
         }));
     }
@@ -486,100 +681,100 @@ mod tests {
     #[test]
     fn parse_flags() {
         assert_eq!(parser("i:").parse_flags(), Ok(AstFlags {
-            span: Span::new(0..1),
+            span: span(0..1),
             items: vec![AstFlagsItem {
-                span: Span::new(0..1),
+                span: span(0..1),
                 kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
             }],
         }));
         assert_eq!(parser("i)").parse_flags(), Ok(AstFlags {
-            span: Span::new(0..1),
+            span: span(0..1),
             items: vec![AstFlagsItem {
-                span: Span::new(0..1),
+                span: span(0..1),
                 kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
             }],
         }));
 
         assert_eq!(parser("isU:").parse_flags(), Ok(AstFlags {
-            span: Span::new(0..3),
+            span: span(0..3),
             items: vec![
                 AstFlagsItem {
-                    span: Span::new(0..1),
+                    span: span(0..1),
                     kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
                 },
                 AstFlagsItem {
-                    span: Span::new(1..2),
+                    span: span(1..2),
                     kind: AstFlagsItemKind::Flag(AstFlag::DotMatchesNewLine),
                 },
                 AstFlagsItem {
-                    span: Span::new(2..3),
+                    span: span(2..3),
                     kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
                 },
             ],
         }));
 
         assert_eq!(parser("-isU:").parse_flags(), Ok(AstFlags {
-            span: Span::new(0..4),
+            span: span(0..4),
             items: vec![
                 AstFlagsItem {
-                    span: Span::new(0..1),
+                    span: span(0..1),
                     kind: AstFlagsItemKind::Negation,
                 },
                 AstFlagsItem {
-                    span: Span::new(1..2),
+                    span: span(1..2),
                     kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
                 },
                 AstFlagsItem {
-                    span: Span::new(2..3),
+                    span: span(2..3),
                     kind: AstFlagsItemKind::Flag(AstFlag::DotMatchesNewLine),
                 },
                 AstFlagsItem {
-                    span: Span::new(3..4),
+                    span: span(3..4),
                     kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
                 },
             ],
         }));
         assert_eq!(parser("i-sU:").parse_flags(), Ok(AstFlags {
-            span: Span::new(0..4),
+            span: span(0..4),
             items: vec![
                 AstFlagsItem {
-                    span: Span::new(0..1),
+                    span: span(0..1),
                     kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
                 },
                 AstFlagsItem {
-                    span: Span::new(1..2),
+                    span: span(1..2),
                     kind: AstFlagsItemKind::Negation,
                 },
                 AstFlagsItem {
-                    span: Span::new(2..3),
+                    span: span(2..3),
                     kind: AstFlagsItemKind::Flag(AstFlag::DotMatchesNewLine),
                 },
                 AstFlagsItem {
-                    span: Span::new(3..4),
+                    span: span(3..4),
                     kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
                 },
             ],
         }));
 
         assert_eq!(parser("isU").parse_flags(), Err(AstError {
-            span: Span::new(3..3),
+            span: span(3..3),
             kind: AstErrorKind::FlagUnexpectedEof,
         }));
         assert_eq!(parser("isUa:").parse_flags(), Err(AstError {
-            span: Span::new(3..4),
+            span: span(3..4),
             kind: AstErrorKind::FlagUnrecognized { flag: 'a' },
         }));
         assert_eq!(parser("isUi:").parse_flags(), Err(AstError {
-            span: Span::new(3..4),
+            span: span(3..4),
             kind: AstErrorKind::FlagDuplicate {
                 flag: 'i',
-                original: Span::new(0..1),
+                original: span(0..1),
             },
         }));
         assert_eq!(parser("i-sU-i:").parse_flags(), Err(AstError {
-            span: Span::new(4..5),
+            span: span(4..5),
             kind: AstErrorKind::FlagRepeatedNegation {
-                original: Span::new(1..2),
+                original: span(1..2),
             },
         }));
     }
@@ -594,12 +789,98 @@ mod tests {
         assert_eq!(parser("x").parse_flag(), Ok(AstFlag::IgnoreWhitespace));
 
         assert_eq!(parser("a").parse_flag(), Err(AstError {
-            span: Span::new(0..1),
+            span: span(0..1),
             kind: AstErrorKind::FlagUnrecognized { flag: 'a' },
         }));
         assert_eq!(parser("☃").parse_flag(), Err(AstError {
-            span: Span::new(0..3),
+            span: span_with(0, "☃"),
             kind: AstErrorKind::FlagUnrecognized { flag: '☃' },
+        }));
+    }
+
+    #[test]
+    fn parse_primitive_non_escape() {
+        assert_eq!(
+            parser(r".").parse_primitive(),
+            Ok(Primitive::Dot(span(0..1))));
+        assert_eq!(
+            parser(r"^").parse_primitive(),
+            Ok(Primitive::Assertion(AstAssertion {
+                span: span(0..1),
+                kind: AstAssertionKind::StartLine,
+            })));
+        assert_eq!(
+            parser(r"$").parse_primitive(),
+            Ok(Primitive::Assertion(AstAssertion {
+                span: span(0..1),
+                kind: AstAssertionKind::EndLine,
+            })));
+
+        assert_eq!(
+            parser(r"a").parse_primitive(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span(0..1),
+                kind: AstLiteralKind::Verbatim,
+                c: 'a',
+            })));
+        assert_eq!(
+            parser(r"|").parse_primitive(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span(0..1),
+                kind: AstLiteralKind::Verbatim,
+                c: '|',
+            })));
+        assert_eq!(
+            parser(r"☃").parse_primitive(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span_with(0, "☃"),
+                kind: AstLiteralKind::Verbatim,
+                c: '☃',
+            })));
+    }
+
+    #[test]
+    fn parse_escape() {
+        assert_eq!(
+            parser(r"\|").parse_primitive(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span(0..2),
+                kind: AstLiteralKind::Punctuation,
+                c: '|',
+            })));
+        let specials = &[
+            (r"\a", '\x07'), (r"\f", '\x0C'), (r"\t", '\t'),
+            (r"\n", '\n'), (r"\r", '\r'), (r"\v", '\x0B'),
+        ];
+        for &(pat, c) in specials {
+            assert_eq!(
+                parser(pat).parse_primitive(),
+                Ok(Primitive::Literal(AstLiteral {
+                    span: span(0..2),
+                    kind: AstLiteralKind::Special,
+                    c: c,
+                })));
+        }
+        assert_eq!(
+            parser(r"\A").parse_primitive(),
+            Ok(Primitive::Assertion(AstAssertion {
+                span: span(0..2),
+                kind: AstAssertionKind::StartText,
+            })));
+        assert_eq!(
+            parser(r"\z").parse_primitive(),
+            Ok(Primitive::Assertion(AstAssertion {
+                span: span(0..2),
+                kind: AstAssertionKind::EndText,
+            })));
+
+        assert_eq!(parser(r"\").parse_escape(), Err(AstError {
+            span: span(0..1),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\y").parse_escape(), Err(AstError {
+            span: span(0..2),
+            kind: AstErrorKind::EscapeUnrecognized { c: 'y' },
         }));
     }
 }
