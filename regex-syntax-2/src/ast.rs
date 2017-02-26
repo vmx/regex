@@ -25,6 +25,7 @@ impl error::Error for AstError {
     fn description(&self) -> &str {
         use self::AstErrorKind::*;
         match self.kind {
+            EscapeHexInvalidDigit{..} => "invalid hexadecimal digit",
             EscapeUnexpectedEof => "unexpected eof (escape sequence)",
             EscapeUnrecognized{..} => "unrecognized escape sequence",
             FlagDuplicate{..} => "duplicate flag",
@@ -42,6 +43,9 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::AstErrorKind::*;
         match self.kind {
+            EscapeHexInvalidDigit { c } => {
+                write!(f, "invalid hexadecimal digit '{}'", c)
+            }
             EscapeUnexpectedEof => {
                 write!(f, "incomplete escape sequence, \
                            reached end of pattern prematurely")
@@ -83,6 +87,11 @@ impl AstError {
 /// The type of an error that occurred while building an AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstErrorKind {
+    /// An invalid hexadecimal digit was found.
+    EscapeHexInvalidDigit {
+        /// The invalid digit (i.e., not [0-9a-zA-Z]).
+        c: char,
+    },
     /// EOF was found before an escape sequence was completed.
     EscapeUnexpectedEof,
     /// An unrecognized escape sequence.
