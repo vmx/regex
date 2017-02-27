@@ -56,6 +56,15 @@ fn is_hex(c: char) -> bool {
     ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F')
 }
 
+/// Returns true if the given character is a valid in a capture group name.
+///
+/// If `first` is true, then `c` is treated as the first character in the
+/// group name (which is not allowed to be a digit).
+fn is_capture_char(c: char, first: bool) -> bool {
+    c == '_' || (!first && c >= '0' && c <= '9')
+    || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 /// A regular expression parser.
 ///
 /// This parses a string representation of a regular expression into an
@@ -158,7 +167,7 @@ impl<'p> Parser<'p> {
     fn bump_if(&self, prefix: &str) -> bool {
         if self.pattern[self.offset()..].starts_with(prefix) {
             for _ in 0..prefix.chars().count() {
-                assert!(self.bump());
+                self.bump();
             }
             true
         } else {
@@ -327,6 +336,13 @@ impl<'s> Parser<'s> {
             span: self.span(),
             asts: vec![],
         };
+        // BREADCRUMBS:
+        //
+        // Three key things left to do:
+        //
+        //   1. Alternations (mostly done at this point with parser state).
+        //   2. Repetition operators. Requires looking at current concat.
+        //   3. Character classes, including nested classes. Joy.
         while !self.is_eof() {
             match self.char() {
                 '(' => concat = try!(self.push_group(concat)),
@@ -392,8 +408,52 @@ impl<'s> Parser<'s> {
         }
     }
 
+    /// Parses a capture group name. Assumes that the parser is positioned at
+    /// the first character in the name following the opening `<` (and may
+    /// possibly be EOF). This advances the parser to the first character
+    /// following the closing `>`.
     fn parse_capture_name(&self) -> Result<AstCaptureName> {
-        unimplemented!()
+        if self.is_eof() {
+            return Err(AstError {
+                span: self.span(),
+                kind: AstErrorKind::GroupNameUnexpectedEof,
+            });
+        }
+        let start = self.pos();
+        loop {
+            if self.char() == '>' {
+                break;
+            }
+            if !is_capture_char(self.char(), self.pos() == start) {
+                return Err(AstError {
+                    span: self.span_char(),
+                    kind: AstErrorKind::GroupNameInvalid { c: self.char() },
+                });
+            }
+            if !self.bump() {
+                break;
+            }
+        }
+        let end = self.pos();
+        if self.is_eof() {
+            return Err(AstError {
+                span: self.span(),
+                kind: AstErrorKind::GroupNameUnexpectedEof,
+            });
+        }
+        assert_eq!(self.char(), '>');
+        self.bump();
+        let name = &self.pattern[start.offset..end.offset];
+        if name.is_empty() {
+            return Err(AstError {
+                span: Span::new(start, start),
+                kind: AstErrorKind::GroupNameEmpty,
+            });
+        }
+        Ok(AstCaptureName {
+            span: Span::new(start, end),
+            name: name.to_string(),
+        })
     }
 
     /// Parse a sequence of flags starting at the current character.
@@ -544,7 +604,6 @@ impl<'s> Parser<'s> {
                 return Ok(Primitive::Literal(lit));
             }
             'x' => {
-                self.bump();
                 let mut lit = try!(self.parse_hex());
                 lit.span.start = start;
                 return Ok(Primitive::Literal(lit));
@@ -555,7 +614,7 @@ impl<'s> Parser<'s> {
                 return Ok(Primitive::Unicode(cls));
             }
             'd' | 's' | 'w' | 'D' | 'S' | 'W' => {
-                let mut cls = try!(self.parse_perl_class());
+                let mut cls = self.parse_perl_class();
                 cls.span.start = start;
                 return Ok(Primitive::Perl(cls));
             }
@@ -642,13 +701,18 @@ impl<'s> Parser<'s> {
     }
 
     /// Parse a hex representation of a Unicode codepoint. This handles both
-    /// hex notations, i.e., `\xFF` and `\x{FFFF}`. This expects the parser
-    /// to be positioned at either the first hexadecimal digit (for the `\xFF`
-    /// noation) or an opening brace `{` (for the `\x{FFFF}` notation). The
-    /// parser is advanced to the first character immediately following the
-    /// hexadecimal literal.
+    /// hex notations, i.e., `\xFF` and `\x{FFFF}`. This expects the parser to
+    /// be positioned at the `x`. The parser is advanced to the first character
+    /// immediately following the hexadecimal literal.
     fn parse_hex(&self) -> Result<AstLiteral> {
-        if self.bump_if("{") {
+        assert_eq!(self.char(), 'x');
+        if !self.bump() {
+            return Err(AstError {
+                span: self.span(),
+                kind: AstErrorKind::EscapeUnexpectedEof,
+            });
+        }
+        if self.char() == '{' {
             self.parse_hex_brace()
         } else {
             self.parse_hex_two()
@@ -684,7 +748,7 @@ impl<'s> Parser<'s> {
         let hex = &self.pattern[start.offset..end.offset];
         // The above checks guarantee a valid hexadecimal literal.
         let codepoint =
-            u32::from_str_radix(&hex, 16).expect("valid hex number");
+            u32::from_str_radix(hex, 16).expect("valid hex number");
         // The max value for a two digit hex literal is 0xFF and [0, 0xFF]
         // has no invalid Unicode scalar values.
         let c = char::from_u32(codepoint).expect("Unicode scalar value");
@@ -695,16 +759,114 @@ impl<'s> Parser<'s> {
         })
     }
 
+    /// Parse a hex representation of any Unicode scalar value. This expects
+    /// the parser to be positioned at the opening brace `{` and will advance
+    /// the parser to the first character following the closing brace `}`.
     fn parse_hex_brace(&self) -> Result<AstLiteral> {
-        unimplemented!()
+        use std::char;
+        use std::u32;
+
+        let brace_pos = self.pos();
+        let start = self.span_char().end;
+        while self.bump() && self.char() != '}' {
+            if !is_hex(self.char()) {
+                return Err(AstError {
+                    span: self.span_char(),
+                    kind: AstErrorKind::EscapeHexInvalidDigit {
+                        c: self.char(),
+                    },
+                });
+            }
+        }
+        if self.is_eof() {
+            return Err(AstError {
+                span: Span::new(brace_pos, self.pos()),
+                kind: AstErrorKind::EscapeUnexpectedEof,
+            })
+        }
+        let end = self.pos();
+        let hex = &self.pattern[start.offset..end.offset];
+        assert_eq!(self.char(), '}');
+        self.bump();
+
+        if hex.is_empty() {
+            return Err(AstError {
+                span: Span::new(brace_pos, self.pos()),
+                kind: AstErrorKind::EscapeHexEmpty,
+            })
+        }
+        match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
+            None => Err(AstError {
+                span: Span::new(start, end),
+                kind: AstErrorKind::EscapeHexInvalid,
+            }),
+            Some(c) => Ok(AstLiteral {
+                span: Span::new(start, self.pos()),
+                kind: AstLiteralKind::Unicode,
+                c: c,
+            }),
+        }
     }
 
+    /// Parse a Unicode class in either the single character notation, `\pN`
+    /// or the multi-character bracketed notation, `\p{Greek}`. This assumes
+    /// the parser is positioned at the `p` (or `P` for negation) and will
+    /// advance the parser to the character immediately following the class.
+    ///
+    /// Note that this does not check whether the class name is valid or not.
     fn parse_unicode_class(&self) -> Result<AstClassUnicode> {
-        unimplemented!()
+        assert!(self.char() == 'p' || self.char() == 'P');
+        let negated = self.char() == 'P';
+        if !self.bump() {
+            return Err(AstError {
+                span: self.span(),
+                kind: AstErrorKind::EscapeUnexpectedEof,
+            });
+        }
+        let (start, end, kind) =
+            if self.char() == '{' {
+                let start = self.span_char().end;
+                while self.bump() && self.char() != '}' {}
+                if self.is_eof() {
+                    return Err(AstError {
+                        span: self.span(),
+                        kind: AstErrorKind::EscapeUnexpectedEof,
+                    });
+                }
+                assert_eq!(self.char(), '}');
+                let end = self.pos();
+                self.bump();
+                (start, end, AstClassUnicodeKind::Bracketed)
+            } else {
+                let start = self.pos();
+                self.bump();
+                (start, self.pos(), AstClassUnicodeKind::OneLetter)
+            };
+        Ok(AstClassUnicode {
+            span: Span::new(start, self.pos()),
+            kind: kind,
+            negated: negated,
+            name: self.pattern[start.offset..end.offset].to_string(),
+        })
     }
 
-    fn parse_perl_class(&self) -> Result<AstClassPerl> {
-        unimplemented!()
+    /// Parse a Perl character class, e.g., `\d` or `\W`. This assumes the
+    /// parser is currently at a valid character class name and will be
+    /// advanced to the character immediately following the class.
+    fn parse_perl_class(&self) -> AstClassPerl {
+        let c = self.char();
+        let span = self.span_char();
+        self.bump();
+        let (negated, kind) = match c {
+            'd' => (false, AstClassPerlKind::Digit),
+            'D' => (true, AstClassPerlKind::Digit),
+            's' => (false, AstClassPerlKind::Space),
+            'S' => (true, AstClassPerlKind::Space),
+            'w' => (false, AstClassPerlKind::Word),
+            'W' => (true, AstClassPerlKind::Word),
+            c => panic!("expected valid Perl class but got '{}'", c),
+        };
+        AstClassPerl { span: span, kind: kind, negated: negated }
     }
 }
 
@@ -794,6 +956,15 @@ mod tests {
             kind: AstGroupKind::CaptureIndex,
             ast: Box::new(Ast::Empty(span(1..1))),
         })));
+        assert_eq!(parser("(a)").parse(), Ok(Ast::Group(AstGroup {
+            span: span(0..3),
+            kind: AstGroupKind::CaptureIndex,
+            ast: Box::new(Ast::Literal(AstLiteral {
+                span: span(1..2),
+                kind: AstLiteralKind::Verbatim,
+                c: 'a',
+            })),
+        })));
         assert_eq!(parser("(())").parse(), Ok(Ast::Group(AstGroup {
             span: span(0..4),
             kind: AstGroupKind::CaptureIndex,
@@ -804,7 +975,67 @@ mod tests {
             })),
         })));
 
+        assert_eq!(parser("(?:a)").parse(), Ok(Ast::Group(AstGroup {
+            span: span(0..5),
+            kind: AstGroupKind::NonCapturing(AstFlags {
+                span: span(2..2),
+                items: vec![],
+            }),
+            ast: Box::new(Ast::Literal(AstLiteral {
+                span: span(3..4),
+                kind: AstLiteralKind::Verbatim,
+                c: 'a',
+            })),
+        })));
+
+        assert_eq!(parser("(?i:a)").parse(), Ok(Ast::Group(AstGroup {
+            span: span(0..6),
+            kind: AstGroupKind::NonCapturing(AstFlags {
+                span: span(2..3),
+                items: vec![
+                    AstFlagsItem {
+                        span: span(2..3),
+                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    },
+                ],
+            }),
+            ast: Box::new(Ast::Literal(AstLiteral {
+                span: span(4..5),
+                kind: AstLiteralKind::Verbatim,
+                c: 'a',
+            })),
+        })));
+        assert_eq!(parser("(?i-U:a)").parse(), Ok(Ast::Group(AstGroup {
+            span: span(0..8),
+            kind: AstGroupKind::NonCapturing(AstFlags {
+                span: span(2..5),
+                items: vec![
+                    AstFlagsItem {
+                        span: span(2..3),
+                        kind: AstFlagsItemKind::Flag(AstFlag::CaseInsensitive),
+                    },
+                    AstFlagsItem {
+                        span: span(3..4),
+                        kind: AstFlagsItemKind::Negation,
+                    },
+                    AstFlagsItem {
+                        span: span(4..5),
+                        kind: AstFlagsItemKind::Flag(AstFlag::SwapGreed),
+                    },
+                ],
+            }),
+            ast: Box::new(Ast::Literal(AstLiteral {
+                span: span(6..7),
+                kind: AstLiteralKind::Verbatim,
+                c: 'a',
+            })),
+        })));
+
         assert_eq!(parser("(").parse(), Err(AstError {
+            span: span(0..1),
+            kind: AstErrorKind::GroupUnclosed,
+        }));
+        assert_eq!(parser("(a").parse(), Err(AstError {
             span: span(0..1),
             kind: AstErrorKind::GroupUnclosed,
         }));
@@ -815,6 +1046,67 @@ mod tests {
         assert_eq!(parser(")").parse(), Err(AstError {
             span: span(0..1),
             kind: AstErrorKind::GroupUnopened,
+        }));
+        assert_eq!(parser("a)").parse(), Err(AstError {
+            span: span(1..2),
+            kind: AstErrorKind::GroupUnopened,
+        }));
+    }
+
+    #[test]
+    fn parse_capture_name() {
+        assert_eq!(parser("(?P<a>z)").parse(), Ok(Ast::Group(AstGroup {
+            span: span(0..8),
+            kind: AstGroupKind::CaptureName(AstCaptureName {
+                span: span(4..5),
+                name: "a".to_string(),
+            }),
+            ast: Box::new(Ast::Literal(AstLiteral {
+                span: span(6..7),
+                kind: AstLiteralKind::Verbatim,
+                c: 'z',
+            })),
+        })));
+        assert_eq!(parser("(?P<abc>z)").parse(), Ok(Ast::Group(AstGroup {
+            span: span(0..10),
+            kind: AstGroupKind::CaptureName(AstCaptureName {
+                span: span(4..7),
+                name: "abc".to_string(),
+            }),
+            ast: Box::new(Ast::Literal(AstLiteral {
+                span: span(8..9),
+                kind: AstLiteralKind::Verbatim,
+                c: 'z',
+            })),
+        })));
+
+        assert_eq!(parser("(?P<").parse(), Err(AstError {
+            span: span(4..4),
+            kind: AstErrorKind::GroupNameUnexpectedEof,
+        }));
+        assert_eq!(parser("(?P<>z)").parse(), Err(AstError {
+            span: span(4..4),
+            kind: AstErrorKind::GroupNameEmpty,
+        }));
+        assert_eq!(parser("(?P<a").parse(), Err(AstError {
+            span: span(5..5),
+            kind: AstErrorKind::GroupNameUnexpectedEof,
+        }));
+        assert_eq!(parser("(?P<ab").parse(), Err(AstError {
+            span: span(6..6),
+            kind: AstErrorKind::GroupNameUnexpectedEof,
+        }));
+        assert_eq!(parser("(?P<0a").parse(), Err(AstError {
+            span: span(4..5),
+            kind: AstErrorKind::GroupNameInvalid { c: '0' },
+        }));
+        assert_eq!(parser("(?P<~").parse(), Err(AstError {
+            span: span(4..5),
+            kind: AstErrorKind::GroupNameInvalid { c: '~' },
+        }));
+        assert_eq!(parser("(?P<abc~").parse(), Err(AstError {
+            span: span(7..8),
+            kind: AstErrorKind::GroupNameInvalid { c: '~' },
         }));
     }
 
@@ -1122,5 +1414,232 @@ mod tests {
             span: span(3..4),
             kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
         }));
+    }
+
+    #[test]
+    fn parse_hex_brace() {
+        assert_eq!(
+            parser(r"\x{26c4}").parse_escape(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span(0..8),
+                kind: AstLiteralKind::Unicode,
+                c: '⛄',
+            })));
+        assert_eq!(
+            parser(r"\x{26C4}").parse_escape(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span(0..8),
+                kind: AstLiteralKind::Unicode,
+                c: '⛄',
+            })));
+        assert_eq!(
+            parser(r"\x{10fFfF}").parse_escape(),
+            Ok(Primitive::Literal(AstLiteral {
+                span: span(0..10),
+                kind: AstLiteralKind::Unicode,
+                c: '\u{10FFFF}',
+            })));
+
+        assert_eq!(parser(r"\x").parse_escape(), Err(AstError {
+            span: span(2..2),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\x{").parse_escape(), Err(AstError {
+            span: span(2..3),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\x{FF").parse_escape(), Err(AstError {
+            span: span(2..5),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\x{}").parse_escape(), Err(AstError {
+            span: span(2..4),
+            kind: AstErrorKind::EscapeHexEmpty,
+        }));
+        assert_eq!(parser(r"\x{FGF}").parse_escape(), Err(AstError {
+            span: span(4..5),
+            kind: AstErrorKind::EscapeHexInvalidDigit { c: 'G' },
+        }));
+        assert_eq!(parser(r"\x{FFFFFF}").parse_escape(), Err(AstError {
+            span: span(3..9),
+            kind: AstErrorKind::EscapeHexInvalid,
+        }));
+        assert_eq!(parser(r"\x{D800}").parse_escape(), Err(AstError {
+            span: span(3..7),
+            kind: AstErrorKind::EscapeHexInvalid,
+        }));
+        assert_eq!(parser(r"\x{FFFFFFFFF}").parse_escape(), Err(AstError {
+            span: span(3..12),
+            kind: AstErrorKind::EscapeHexInvalid,
+        }));
+    }
+
+    #[test]
+    fn parse_unicode_class() {
+        assert_eq!(
+            parser(r"\pN").parse_escape(),
+            Ok(Primitive::Unicode(AstClassUnicode {
+                span: span(0..3),
+                kind: AstClassUnicodeKind::OneLetter,
+                negated: false,
+                name: "N".to_string(),
+            })));
+        assert_eq!(
+            parser(r"\PN").parse_escape(),
+            Ok(Primitive::Unicode(AstClassUnicode {
+                span: span(0..3),
+                kind: AstClassUnicodeKind::OneLetter,
+                negated: true,
+                name: "N".to_string(),
+            })));
+        assert_eq!(
+            parser(r"\p{N}").parse_escape(),
+            Ok(Primitive::Unicode(AstClassUnicode {
+                span: span(0..5),
+                kind: AstClassUnicodeKind::Bracketed,
+                negated: false,
+                name: "N".to_string(),
+            })));
+        assert_eq!(
+            parser(r"\P{N}").parse_escape(),
+            Ok(Primitive::Unicode(AstClassUnicode {
+                span: span(0..5),
+                kind: AstClassUnicodeKind::Bracketed,
+                negated: true,
+                name: "N".to_string(),
+            })));
+        assert_eq!(
+            parser(r"\p{Greek}").parse_escape(),
+            Ok(Primitive::Unicode(AstClassUnicode {
+                span: span(0..9),
+                kind: AstClassUnicodeKind::Bracketed,
+                negated: false,
+                name: "Greek".to_string(),
+            })));
+
+        assert_eq!(parser(r"\p").parse_escape(), Err(AstError {
+            span: span(2..2),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\p{").parse_escape(), Err(AstError {
+            span: span(3..3),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\p{N").parse_escape(), Err(AstError {
+            span: span(4..4),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+        assert_eq!(parser(r"\p{Greek").parse_escape(), Err(AstError {
+            span: span(8..8),
+            kind: AstErrorKind::EscapeUnexpectedEof,
+        }));
+
+        assert_eq!(
+            parser(r"\pNz").parse(),
+            Ok(Ast::Concat(AstConcat {
+                span: span(0..4),
+                asts: vec![
+                    Ast::Class(AstClass::Unicode(AstClassUnicode {
+                        span: span(0..3),
+                        kind: AstClassUnicodeKind::OneLetter,
+                        negated: false,
+                        name: "N".to_string(),
+                    })),
+                    Ast::Literal(AstLiteral {
+                        span: span(3..4),
+                        kind: AstLiteralKind::Verbatim,
+                        c: 'z',
+                    }),
+                ],
+            })));
+        assert_eq!(
+            parser(r"\p{Greek}z").parse(),
+            Ok(Ast::Concat(AstConcat {
+                span: span(0..10),
+                asts: vec![
+                    Ast::Class(AstClass::Unicode(AstClassUnicode {
+                        span: span(0..9),
+                        kind: AstClassUnicodeKind::Bracketed,
+                        negated: false,
+                        name: "Greek".to_string(),
+                    })),
+                    Ast::Literal(AstLiteral {
+                        span: span(9..10),
+                        kind: AstLiteralKind::Verbatim,
+                        c: 'z',
+                    }),
+                ],
+            })));
+    }
+
+    #[test]
+    fn parse_perl_class() {
+        assert_eq!(
+            parser(r"\d").parse_escape(),
+            Ok(Primitive::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Digit,
+                negated: false,
+            })));
+        assert_eq!(
+            parser(r"\D").parse_escape(),
+            Ok(Primitive::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Digit,
+                negated: true,
+            })));
+        assert_eq!(
+            parser(r"\s").parse_escape(),
+            Ok(Primitive::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Space,
+                negated: false,
+            })));
+        assert_eq!(
+            parser(r"\S").parse_escape(),
+            Ok(Primitive::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Space,
+                negated: true,
+            })));
+        assert_eq!(
+            parser(r"\w").parse_escape(),
+            Ok(Primitive::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Word,
+                negated: false,
+            })));
+        assert_eq!(
+            parser(r"\W").parse_escape(),
+            Ok(Primitive::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Word,
+                negated: true,
+            })));
+
+        assert_eq!(
+            parser(r"\d").parse(),
+            Ok(Ast::Class(AstClass::Perl(AstClassPerl {
+                span: span(0..2),
+                kind: AstClassPerlKind::Digit,
+                negated: false,
+            }))));
+        assert_eq!(
+            parser(r"\dz").parse(),
+            Ok(Ast::Concat(AstConcat {
+                span: span(0..3),
+                asts: vec![
+                    Ast::Class(AstClass::Perl(AstClassPerl {
+                        span: span(0..2),
+                        kind: AstClassPerlKind::Digit,
+                        negated: false,
+                    })),
+                    Ast::Literal(AstLiteral {
+                        span: span(2..3),
+                        kind: AstLiteralKind::Verbatim,
+                        c: 'z',
+                    }),
+                ],
+            })));
     }
 }

@@ -25,6 +25,8 @@ impl error::Error for AstError {
     fn description(&self) -> &str {
         use self::AstErrorKind::*;
         match self.kind {
+            EscapeHexEmpty => "empty hexadecimal literal",
+            EscapeHexInvalid => "invalid hexadecimal literal",
             EscapeHexInvalidDigit{..} => "invalid hexadecimal digit",
             EscapeUnexpectedEof => "unexpected eof (escape sequence)",
             EscapeUnrecognized{..} => "unrecognized escape sequence",
@@ -33,6 +35,9 @@ impl error::Error for AstError {
             FlagUnexpectedEof => "unexpected eof (flag)",
             FlagUnrecognized{..} => "unrecognized flag",
             GroupEmpty => "empty group",
+            GroupNameEmpty => "empty capture group name",
+            GroupNameInvalid{..} => "invalid capture group name",
+            GroupNameUnexpectedEof => "unclosed capture group name",
             GroupUnclosed => "unclosed group",
             GroupUnopened => "unopened group",
         }
@@ -43,6 +48,12 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::AstErrorKind::*;
         match self.kind {
+            EscapeHexEmpty => {
+                write!(f, "hexadecimal literal empty")
+            }
+            EscapeHexInvalid => {
+                write!(f, "hexadecimal literal is not a Unicode scalar value")
+            }
             EscapeHexInvalidDigit { c } => {
                 write!(f, "invalid hexadecimal digit '{}'", c)
             }
@@ -68,6 +79,15 @@ impl fmt::Display for AstError {
             GroupEmpty => {
                 write!(f, "empty group")
             }
+            GroupNameEmpty => {
+                write!(f, "empty capture group name")
+            }
+            GroupNameInvalid{ c } => {
+                write!(f, "invalid capture group character '{}'", c)
+            }
+            GroupNameUnexpectedEof => {
+                write!(f, "unclosed capture group name")
+            }
             GroupUnclosed => {
                 write!(f, "unclosed group")
             }
@@ -87,6 +107,10 @@ impl AstError {
 /// The type of an error that occurred while building an AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstErrorKind {
+    /// A bracketed hex literal was empty.
+    EscapeHexEmpty,
+    /// A bracketed hex literal did not correspond to a Unicode scalar value.
+    EscapeHexInvalid,
     /// An invalid hexadecimal digit was found.
     EscapeHexInvalidDigit {
         /// The invalid digit (i.e., not [0-9a-zA-Z]).
@@ -122,6 +146,18 @@ pub enum AstErrorKind {
     },
     /// An empty group, e.g., `()`.
     GroupEmpty,
+    /// A capture group name is empty, e.g., `(?P<>abc)`.
+    GroupNameEmpty,
+    /// An invalid character was seen for a capture group name. This includes
+    /// errors where the first character is a digit (even though subsequent
+    /// characters are allowed to be digits).
+    GroupNameInvalid {
+        /// The invalid character. This may be a digit if it's the first
+        /// character in the name.
+        c: char,
+    },
+    /// A closing `>` could not be found for a capture group name.
+    GroupNameUnexpectedEof,
     /// An unclosed group, e.g., `(ab`.
     ///
     /// The span of this error corresponds to the unclosed parenthesis.
@@ -444,6 +480,8 @@ pub struct AstClassUnicode {
     pub span: Span,
     /// The kind of Unicode class.
     pub kind: AstClassUnicodeKind,
+    /// Whether this class is negated or not.
+    pub negated: bool,
     /// The name of the Unicode class. This corresponds to a Unicode
     /// general category or script.
     pub name: String,
@@ -454,8 +492,8 @@ pub struct AstClassUnicode {
 pub enum AstClassUnicodeKind {
     /// A one letter abbreviated class, e.g., `\pN`.
     OneLetter,
-    /// A fully named class, e.g., `\p{Greek}`.
-    FullName,
+    /// A fully named class in braces, e.g., `\p{Greek}`.
+    Bracketed,
 }
 
 /// A Unicode character class set, e.g., `[a-z0-9]`.
