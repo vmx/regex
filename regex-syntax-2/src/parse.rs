@@ -97,6 +97,15 @@ enum State {
     Alternation(AstAlternation),
 }
 
+impl State {
+    fn is_alternation(&self) -> bool {
+        match *self {
+            State::Alternation(_) => true,
+            _ => false,
+        }
+    }
+}
+
 impl<'p> Parser<'p> {
     /// Create a new parser for the given regular expression.
     pub fn new(pattern: &str) -> Parser {
@@ -221,6 +230,40 @@ impl<'p> Parser<'p> {
         self.stack.borrow_mut().pop()
     }
 
+    /// Parse and push a single alternation on to the parser's internal stack.
+    /// If the top of the stack already has an alternation, then add to that
+    /// instead of pushing a new one.
+    ///
+    /// The concatenation given corresponds to a single alternation branch.
+    /// The concatenation returned starts the next branch and is empty.
+    ///
+    /// This assumes the parser is currently positioned at `|` and will advance
+    /// the parser to the character following `|`.
+    fn push_alternate(&self, mut concat: AstConcat) -> Result<AstConcat> {
+        assert_eq!(self.char(), '|');
+        concat.span.end = self.pos();
+        self.push_or_add_alternation(concat);
+        self.bump();
+        Ok(AstConcat {
+            span: self.span(),
+            asts: vec![],
+        })
+    }
+
+    /// Pushes or adds the given branch of an alternation to the parser's
+    /// internal stack of state.
+    fn push_or_add_alternation(&self, concat: AstConcat) {
+        let mut stack = self.stack.borrow_mut();
+        if let Some(&mut State::Alternation(ref mut alts)) = stack.last_mut() {
+            alts.asts.push(concat.into_ast());
+            return;
+        }
+        stack.push(State::Alternation(AstAlternation {
+            span: Span::new(concat.span.start, self.pos()),
+            asts: vec![concat.into_ast()],
+        }));
+    }
+
     /// Parse and push a group AST (and its parent concatenation) on to the
     /// parser's internal stack. Return a fresh concatenation corresponding
     /// to the group's sub-AST.
@@ -291,6 +334,7 @@ impl<'p> Parser<'p> {
         group.span.end = self.pos();
         match alt {
             Some(mut alt) => {
+                alt.span.end = group_concat.span.end;
                 alt.asts.push(group_concat.into_ast());
                 group.ast = Box::new(alt.into_ast());
             }
@@ -310,11 +354,31 @@ impl<'p> Parser<'p> {
     /// This assumes that the parser has advanced to the end.
     fn pop_end(&self, mut concat: AstConcat) -> Result<Ast> {
         concat.span.end = self.pos();
-        match self.state_pop() {
+        let ast = match self.state_pop() {
             None => Ok(concat.into_ast()),
             Some(State::Alternation(mut alt)) => {
+                alt.span.end = self.pos();
                 alt.asts.push(concat.into_ast());
                 Ok(Ast::Alternation(alt))
+            }
+            Some(State::Group { group, .. }) => {
+                return Err(AstError {
+                    span: group.span,
+                    kind: AstErrorKind::GroupUnclosed,
+                });
+            }
+        };
+        // If we try to pop again, there should be nothing.
+        match self.state_pop() {
+            None => ast,
+            Some(State::Alternation(_)) => {
+                // This unreachable (the only one in the entire parser) is
+                // unfortunate. This case can't happen because the only way
+                // we can be here is if there were two `State::Alternation`s
+                // adjacent in the parser's stack, which we guarantee to never
+                // happen because we never push a `State::Alternation` if one
+                // is already at the top of the stack.
+                unreachable!()
             }
             Some(State::Group { group, .. }) => {
                 Err(AstError {
@@ -340,13 +404,14 @@ impl<'s> Parser<'s> {
         //
         // Three key things left to do:
         //
-        //   1. Alternations (mostly done at this point with parser state).
+        // x 1. Alternations (mostly done at this point with parser state).
         //   2. Repetition operators. Requires looking at current concat.
         //   3. Character classes, including nested classes. Joy.
         while !self.is_eof() {
             match self.char() {
                 '(' => concat = try!(self.push_group(concat)),
                 ')' => concat = try!(self.pop_group(concat)),
+                '|' => concat = try!(self.push_alternate(concat)),
                 _ => concat.asts.push(try!(self.parse_primitive()).into_ast()),
             }
         }
@@ -902,6 +967,132 @@ mod tests {
         Span::new(start, end)
     }
 
+    /// Create a verbatim literal starting at the given position.
+    fn lit(c: char, start: usize) -> Ast {
+        Ast::Literal(AstLiteral {
+            span: span(start..start + c.len_utf8()),
+            kind: AstLiteralKind::Verbatim,
+            c: c,
+        })
+    }
+
+    /// Create a concatenation with the given span.
+    fn concat(range: Range<usize>, asts: Vec<Ast>) -> Ast {
+        Ast::Concat(AstConcat { span: span(range), asts: asts })
+    }
+
+    /// Create an alternation with the given span.
+    fn alt(range: Range<usize>, asts: Vec<Ast>) -> Ast {
+        Ast::Alternation(AstAlternation { span: span(range), asts: asts })
+    }
+
+    /// Create a capturing group with the given span.
+    fn group(range: Range<usize>, ast: Ast) -> Ast {
+        Ast::Group(AstGroup {
+            span: span(range),
+            kind: AstGroupKind::CaptureIndex,
+            ast: Box::new(ast),
+        })
+    }
+
+    #[test]
+    fn parse_alternate() {
+        assert_eq!(
+            parser(r"a|b").parse(),
+            Ok(Ast::Alternation(AstAlternation {
+                span: span(0..3),
+                asts: vec![lit('a', 0), lit('b', 2)],
+            })));
+        assert_eq!(
+            parser(r"(a|b)").parse(),
+            Ok(group(0..5, Ast::Alternation(AstAlternation {
+                span: span(1..4),
+                asts: vec![lit('a', 1), lit('b', 3)],
+            }))));
+
+        assert_eq!(
+            parser(r"a|b|c").parse(),
+            Ok(Ast::Alternation(AstAlternation {
+                span: span(0..5),
+                asts: vec![lit('a', 0), lit('b', 2), lit('c', 4)],
+            })));
+        assert_eq!(
+            parser(r"ax|by|cz").parse(),
+            Ok(Ast::Alternation(AstAlternation {
+                span: span(0..8),
+                asts: vec![
+                    concat(0..2, vec![lit('a', 0), lit('x', 1)]),
+                    concat(3..5, vec![lit('b', 3), lit('y', 4)]),
+                    concat(6..8, vec![lit('c', 6), lit('z', 7)]),
+                ],
+            })));
+        assert_eq!(
+            parser(r"(ax|by|cz)").parse(),
+            Ok(group(0..10, Ast::Alternation(AstAlternation {
+                span: span(1..9),
+                asts: vec![
+                    concat(1..3, vec![lit('a', 1), lit('x', 2)]),
+                    concat(4..6, vec![lit('b', 4), lit('y', 5)]),
+                    concat(7..9, vec![lit('c', 7), lit('z', 8)]),
+                ],
+            }))));
+        assert_eq!(
+            parser(r"(ax|(by|(cz)))").parse(),
+            Ok(group(0..14, alt(1..13, vec![
+                concat(1..3, vec![lit('a', 1), lit('x', 2)]),
+                group(4..13, alt(5..12, vec![
+                    concat(5..7, vec![lit('b', 5), lit('y', 6)]),
+                    group(8..12, concat(9..11, vec![
+                        lit('c', 9),
+                        lit('z', 10),
+                    ])),
+                ])),
+            ]))));
+
+        assert_eq!(
+            parser(r"|").parse(), Ok(alt(0..1, vec![
+                Ast::Empty(span(0..0)), Ast::Empty(span(1..1)),
+            ])));
+        assert_eq!(
+            parser(r"||").parse(), Ok(alt(0..2, vec![
+                Ast::Empty(span(0..0)),
+                Ast::Empty(span(1..1)),
+                Ast::Empty(span(2..2)),
+            ])));
+        assert_eq!(
+            parser(r"a|").parse(), Ok(alt(0..2, vec![
+                lit('a', 0), Ast::Empty(span(2..2)),
+            ])));
+        assert_eq!(
+            parser(r"|a").parse(), Ok(alt(0..2, vec![
+                Ast::Empty(span(0..0)), lit('a', 1),
+            ])));
+
+        assert_eq!(
+            parser(r"(|)").parse(), Ok(group(0..3, alt(1..2, vec![
+                Ast::Empty(span(1..1)), Ast::Empty(span(2..2)),
+            ]))));
+        assert_eq!(
+            parser(r"(a|)").parse(), Ok(group(0..4, alt(1..3, vec![
+                lit('a', 1), Ast::Empty(span(3..3)),
+            ]))));
+        assert_eq!(
+            parser(r"(|a)").parse(), Ok(group(0..4, alt(1..3, vec![
+                Ast::Empty(span(1..1)), lit('a', 2),
+            ]))));
+
+        assert_eq!(
+            parser(r"a|b)").parse(), Err(AstError {
+                span: span(3..4),
+                kind: AstErrorKind::GroupUnopened,
+            }));
+        assert_eq!(
+            parser(r"(a|b").parse(), Err(AstError {
+                span: span(0..1),
+                kind: AstErrorKind::GroupUnclosed,
+            }));
+    }
+
     #[test]
     fn parse_group() {
         assert_eq!(parser("(?i)").parse(), Ok(Ast::Flags(AstSetFlags {
@@ -959,11 +1150,7 @@ mod tests {
         assert_eq!(parser("(a)").parse(), Ok(Ast::Group(AstGroup {
             span: span(0..3),
             kind: AstGroupKind::CaptureIndex,
-            ast: Box::new(Ast::Literal(AstLiteral {
-                span: span(1..2),
-                kind: AstLiteralKind::Verbatim,
-                c: 'a',
-            })),
+            ast: Box::new(lit('a', 1)),
         })));
         assert_eq!(parser("(())").parse(), Ok(Ast::Group(AstGroup {
             span: span(0..4),
@@ -981,11 +1168,7 @@ mod tests {
                 span: span(2..2),
                 items: vec![],
             }),
-            ast: Box::new(Ast::Literal(AstLiteral {
-                span: span(3..4),
-                kind: AstLiteralKind::Verbatim,
-                c: 'a',
-            })),
+            ast: Box::new(lit('a', 3)),
         })));
 
         assert_eq!(parser("(?i:a)").parse(), Ok(Ast::Group(AstGroup {
@@ -999,11 +1182,7 @@ mod tests {
                     },
                 ],
             }),
-            ast: Box::new(Ast::Literal(AstLiteral {
-                span: span(4..5),
-                kind: AstLiteralKind::Verbatim,
-                c: 'a',
-            })),
+            ast: Box::new(lit('a', 4)),
         })));
         assert_eq!(parser("(?i-U:a)").parse(), Ok(Ast::Group(AstGroup {
             span: span(0..8),
@@ -1024,11 +1203,7 @@ mod tests {
                     },
                 ],
             }),
-            ast: Box::new(Ast::Literal(AstLiteral {
-                span: span(6..7),
-                kind: AstLiteralKind::Verbatim,
-                c: 'a',
-            })),
+            ast: Box::new(lit('a', 6)),
         })));
 
         assert_eq!(parser("(").parse(), Err(AstError {
@@ -1061,11 +1236,7 @@ mod tests {
                 span: span(4..5),
                 name: "a".to_string(),
             }),
-            ast: Box::new(Ast::Literal(AstLiteral {
-                span: span(6..7),
-                kind: AstLiteralKind::Verbatim,
-                c: 'z',
-            })),
+            ast: Box::new(lit('z', 6)),
         })));
         assert_eq!(parser("(?P<abc>z)").parse(), Ok(Ast::Group(AstGroup {
             span: span(0..10),
@@ -1073,11 +1244,7 @@ mod tests {
                 span: span(4..7),
                 name: "abc".to_string(),
             }),
-            ast: Box::new(Ast::Literal(AstLiteral {
-                span: span(8..9),
-                kind: AstLiteralKind::Verbatim,
-                c: 'z',
-            })),
+            ast: Box::new(lit('z', 8)),
         })));
 
         assert_eq!(parser("(?P<").parse(), Err(AstError {
