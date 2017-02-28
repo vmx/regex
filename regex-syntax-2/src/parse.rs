@@ -406,7 +406,8 @@ impl<'s> Parser<'s> {
         //
         // x 1. Alternations (mostly done at this point with parser state).
         //   2. Repetition operators. Requires looking at current concat.
-        //   3. Character classes, including nested classes. Joy.
+        //   3. Implement support for (?x).
+        //   4. Character classes, including nested classes. Joy.
         while !self.is_eof() {
             match self.char() {
                 '(' => concat = try!(self.push_group(concat)),
@@ -1471,6 +1472,18 @@ mod tests {
             Ok(Primitive::Assertion(AstAssertion {
                 span: span(0..2),
                 kind: AstAssertionKind::EndText,
+            })));
+        assert_eq!(
+            parser(r"\b").parse_primitive(),
+            Ok(Primitive::Assertion(AstAssertion {
+                span: span(0..2),
+                kind: AstAssertionKind::WordBoundary,
+            })));
+        assert_eq!(
+            parser(r"\B").parse_primitive(),
+            Ok(Primitive::Assertion(AstAssertion {
+                span: span(0..2),
+                kind: AstAssertionKind::NotWordBoundary,
             })));
 
         assert_eq!(parser(r"\").parse_escape(), Err(AstError {
