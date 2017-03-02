@@ -230,6 +230,39 @@ impl<'p> Parser<'p> {
         self.stack.borrow_mut().pop()
     }
 
+    /// Parse and push a repetition operator on to the given concatenation.
+    /// The operator is applied to the last AST in the concatenation. If the
+    /// concatenation is empty, then the operator is applied to the empty AST.
+    ///
+    /// This assumes the parser is currently positioned at the repetition
+    /// operator (?, * or +) and advances the parser to the first character
+    /// after the operator.
+    fn push_repetition(
+        &self,
+        mut concat: AstConcat,
+        kind: AstRepetitionKind,
+    ) -> AstConcat {
+        assert!(self.char() == '?'
+                || self.char() == '*'
+                || self.char() == '+');
+        let ast = match concat.asts.pop() {
+            None => Ast::Empty(self.span()),
+            Some(ast) => ast,
+        };
+        let mut greedy = true;
+        if self.bump() && self.char() == '?' {
+            greedy = false;
+            self.bump();
+        }
+        concat.asts.push(Ast::Repetition(AstRepetition {
+            span: ast.span().with_end(self.pos()),
+            kind: kind,
+            greedy: greedy,
+            ast: Box::new(ast),
+        }));
+        concat
+    }
+
     /// Parse and push a single alternation on to the parser's internal stack.
     /// If the top of the stack already has an alternation, then add to that
     /// instead of pushing a new one.
@@ -405,7 +438,7 @@ impl<'s> Parser<'s> {
         // Three key things left to do:
         //
         // x 1. Alternations (mostly done at this point with parser state).
-        //   2. Repetition operators. Requires looking at current concat.
+        // x 2. Repetition operators. Requires looking at current concat.
         //   3. Implement support for (?x).
         //   4. Character classes, including nested classes. Joy.
         while !self.is_eof() {
@@ -413,6 +446,18 @@ impl<'s> Parser<'s> {
                 '(' => concat = try!(self.push_group(concat)),
                 ')' => concat = try!(self.pop_group(concat)),
                 '|' => concat = try!(self.push_alternate(concat)),
+                '?' => {
+                    concat = self.push_repetition(
+                        concat, AstRepetitionKind::ZeroOrOne);
+                }
+                '*' => {
+                    concat = self.push_repetition(
+                        concat, AstRepetitionKind::ZeroOrMore);
+                }
+                '+' => {
+                    concat = self.push_repetition(
+                        concat, AstRepetitionKind::OneOrMore);
+                }
                 _ => concat.asts.push(try!(self.parse_primitive()).into_ast()),
             }
         }
@@ -994,6 +1039,106 @@ mod tests {
             kind: AstGroupKind::CaptureIndex,
             ast: Box::new(ast),
         })
+    }
+
+    #[test]
+    fn parse_repetition() {
+        assert_eq!(
+            parser(r"*").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..1),
+                kind: AstRepetitionKind::ZeroOrMore,
+                greedy: true,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
+        assert_eq!(
+            parser(r"+").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..1),
+                kind: AstRepetitionKind::OneOrMore,
+                greedy: true,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
+
+        assert_eq!(
+            parser(r"?").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..1),
+                kind: AstRepetitionKind::ZeroOrOne,
+                greedy: true,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
+        assert_eq!(
+            parser(r"??").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..2),
+                kind: AstRepetitionKind::ZeroOrOne,
+                greedy: false,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
+        assert_eq!(
+            parser(r"a?").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..2),
+                kind: AstRepetitionKind::ZeroOrOne,
+                greedy: true,
+                ast: Box::new(lit('a', 0)),
+            })));
+        assert_eq!(
+            parser(r"a?b").parse(),
+            Ok(concat(0..3, vec![
+                Ast::Repetition(AstRepetition {
+                    span: span(0..2),
+                    kind: AstRepetitionKind::ZeroOrOne,
+                    greedy: true,
+                    ast: Box::new(lit('a', 0)),
+                }),
+                lit('b', 2),
+            ])));
+        assert_eq!(
+            parser(r"a??b").parse(),
+            Ok(concat(0..4, vec![
+                Ast::Repetition(AstRepetition {
+                    span: span(0..3),
+                    kind: AstRepetitionKind::ZeroOrOne,
+                    greedy: false,
+                    ast: Box::new(lit('a', 0)),
+                }),
+                lit('b', 3),
+            ])));
+        assert_eq!(
+            parser(r"ab?").parse(),
+            Ok(concat(0..3, vec![
+                lit('a', 0),
+                Ast::Repetition(AstRepetition {
+                    span: span(1..3),
+                    kind: AstRepetitionKind::ZeroOrOne,
+                    greedy: true,
+                    ast: Box::new(lit('b', 1)),
+                }),
+            ])));
+        assert_eq!(
+            parser(r"(ab)?").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..5),
+                kind: AstRepetitionKind::ZeroOrOne,
+                greedy: true,
+                ast: Box::new(group(0..4, concat(1..3, vec![
+                    lit('a', 1),
+                    lit('b', 2),
+                ]))),
+            })));
+        assert_eq!(
+            parser(r"|?").parse(),
+            Ok(alt(0..2, vec![
+                Ast::Empty(span(0..0)),
+                Ast::Repetition(AstRepetition {
+                    span: span(1..2),
+                    kind: AstRepetitionKind::ZeroOrOne,
+                    greedy: true,
+                    ast: Box::new(Ast::Empty(span(1..1))),
+                }),
+            ])));
     }
 
     #[test]
