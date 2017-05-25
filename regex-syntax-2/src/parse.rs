@@ -210,11 +210,15 @@ impl<'p> Parser<'p> {
 
     /// Create a span that covers the current character.
     fn span_char(&self) -> Span {
-        let next = Position {
+        let mut next = Position {
             offset: self.offset().checked_add(self.char().len_utf8()).unwrap(),
             line: self.line(),
             column: self.column().checked_add(1).unwrap(),
         };
+        if self.char() == '\n' {
+            next.line += 1;
+            next.column = 1;
+        }
         Span::new(self.pos(), next)
     }
 
@@ -1013,18 +1017,53 @@ mod tests {
         Span::new(start, end)
     }
 
+    /// Create a new span for the corresponding byte range in the given string.
+    fn span_range(subject: &str, start: usize, end: usize) -> Span {
+        let start = Position {
+            offset: start,
+            line: 1 + subject[..start].matches('\n').count(),
+            column: 1 + subject[..start]
+                .as_bytes()
+                .iter()
+                .rev()
+                .position(|&b| b == b'\n')
+                .unwrap_or(start),
+        };
+        let end = Position {
+            offset: end,
+            line: 1 + subject[..end].matches('\n').count(),
+            column: 1 + subject[..end]
+                .as_bytes()
+                .iter()
+                .rev()
+                .position(|&b| b == b'\n')
+                .unwrap_or(end),
+        };
+        Span::new(start, end)
+    }
+
     /// Create a verbatim literal starting at the given position.
     fn lit(c: char, start: usize) -> Ast {
+        lit_with(c, span(start..start + c.len_utf8()))
+    }
+
+    /// Create a verbatim literal with the given span.
+    fn lit_with(c: char, span: Span) -> Ast {
         Ast::Literal(AstLiteral {
-            span: span(start..start + c.len_utf8()),
+            span: span,
             kind: AstLiteralKind::Verbatim,
             c: c,
         })
     }
 
-    /// Create a concatenation with the given span.
+    /// Create a concatenation with the given range.
     fn concat(range: Range<usize>, asts: Vec<Ast>) -> Ast {
-        Ast::Concat(AstConcat { span: span(range), asts: asts })
+        concat_with(span(range), asts)
+    }
+
+    /// Create a concatenation with the given span.
+    fn concat_with(span: Span, asts: Vec<Ast>) -> Ast {
+        Ast::Concat(AstConcat { span: span, asts: asts })
     }
 
     /// Create an alternation with the given span.
@@ -1039,6 +1078,18 @@ mod tests {
             kind: AstGroupKind::CaptureIndex,
             ast: Box::new(ast),
         })
+    }
+
+    #[test]
+    fn parse_newlines() {
+        let pat = ".\n.";
+        assert_eq!(
+            parser(pat).parse(),
+            Ok(concat_with(span_range(pat, 0, 3), vec![
+                Ast::Class(AstClass::Dot(span_range(pat, 0, 1))),
+                lit_with('\n', span_range(pat, 1, 2)),
+                Ast::Class(AstClass::Dot(span_range(pat, 2, 3))),
+            ])));
     }
 
     #[test]

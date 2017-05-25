@@ -170,7 +170,7 @@ pub enum AstErrorKind {
 ///
 /// All span positions are absolute byte offsets that can be used on the
 /// original regular expression that was parsed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Span {
     /// The start byte offset.
     pub start: Position,
@@ -178,7 +178,13 @@ pub struct Span {
     pub end: Position,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl fmt::Debug for Span {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Span({:?}, {:?})", self.start, self.end)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Position {
     /// The absolute offset of this position, starting at `0` from the
     /// beginning of the regular expression pattern string.
@@ -187,6 +193,15 @@ pub struct Position {
     pub line: usize,
     /// The approximate column number, starting at `1`.
     pub column: usize,
+}
+
+impl fmt::Debug for Position {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Position(o: {:?}, l: {:?}, c: {:?})",
+            self.offset, self.line, self.column)
+    }
 }
 
 impl Span {
