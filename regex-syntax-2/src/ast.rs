@@ -668,6 +668,17 @@ pub struct AstGroup {
     pub ast: Box<Ast>,
 }
 
+impl AstGroup {
+    /// If this group is non-capturing, then this returns the (possibly empty)
+    /// set of flags. Otherwise, `None` is returned.
+    pub fn flags(&self) -> Option<&AstFlags> {
+        match self.kind {
+            AstGroupKind::NonCapturing(ref flags) => Some(flags),
+            _ => None,
+        }
+    }
+}
+
 /// The kind of a group.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstGroupKind {
@@ -724,6 +735,31 @@ impl AstFlags {
         self.items.push(item);
         None
     }
+
+    /// Returns the state of the given flag in this set.
+    ///
+    /// If the given flag is in the set but is negated, then `Some(false)` is
+    /// returned.
+    ///
+    /// If the given flag is in the set and is not negated, then `Some(true)`
+    /// is returned.
+    ///
+    /// Otherwise, `None` is returned.
+    pub fn flag_state(&self, flag: AstFlag) -> Option<bool> {
+        let mut negated = false;
+        for x in &self.items {
+            match x.kind {
+                AstFlagsItemKind::Negation => {
+                    negated = true;
+                }
+                AstFlagsItemKind::Flag(ref xflag) if xflag == &flag => {
+                    return Some(!negated);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 /// A single item in a group of flags.
@@ -745,8 +781,18 @@ pub enum AstFlagsItemKind {
     Flag(AstFlag),
 }
 
+impl AstFlagsItemKind {
+    /// Returns true if and only if this item is a negation operator.
+    pub fn is_negation(&self) -> bool {
+        match *self {
+            AstFlagsItemKind::Negation => true,
+            _ => false,
+        }
+    }
+}
+
 /// A single flag.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AstFlag {
     /// `i`
     CaseInsensitive,

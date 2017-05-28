@@ -992,8 +992,32 @@ mod tests {
     use ast::*;
     use super::{Parser, Primitive};
 
+    macro_rules! assert_eq {
+        ($left:expr, $right:expr) => ({
+            match (&$left, &$right) {
+                (left_val, right_val) => {
+                    if !(*left_val == *right_val) {
+                        panic!("assertion failed: `(left == right)`\n\n\
+                               left:  `{:?}`\nright: `{:?}`\n\n",
+                               left_val, right_val)
+                    }
+                }
+            }
+        });
+    }
+
     fn parser(pattern: &str) -> Parser {
         Parser::new(pattern)
+    }
+
+    /// Short alias for creating a new span.
+    fn nspan(start: Position, end: Position) -> Span {
+        Span::new(start, end)
+    }
+
+    /// Short alias for creating a new position.
+    fn npos(offset: usize, line: usize, column: usize) -> Position {
+        Position::new(offset, line, column)
     }
 
     /// Create a new span from the given offset range. This assumes a single
@@ -1005,39 +1029,25 @@ mod tests {
         Span::new(start, end)
     }
 
-    /// Create a new span starting at the given offset/column and ending where
-    /// the given string ends.
-    fn span_with(start: usize, ending_at: &str) -> Span {
-        let start = Position::new(start, 1, start + 1);
-        let end = Position {
-            offset: start.offset + ending_at.len(),
-            line: start.line + ending_at.matches('\n').count(),
-            column: start.column + ending_at.chars().count(),
-        };
-        Span::new(start, end)
-    }
-
     /// Create a new span for the corresponding byte range in the given string.
-    fn span_range(subject: &str, start: usize, end: usize) -> Span {
+    fn span_range(subject: &str, range: Range<usize>) -> Span {
         let start = Position {
-            offset: start,
-            line: 1 + subject[..start].matches('\n').count(),
-            column: 1 + subject[..start]
-                .as_bytes()
-                .iter()
+            offset: range.start,
+            line: 1 + subject[..range.start].matches('\n').count(),
+            column: 1 + subject[..range.start]
+                .chars()
                 .rev()
-                .position(|&b| b == b'\n')
-                .unwrap_or(start),
+                .position(|c| c == '\n')
+                .unwrap_or(subject[..range.start].chars().count()),
         };
         let end = Position {
-            offset: end,
-            line: 1 + subject[..end].matches('\n').count(),
-            column: 1 + subject[..end]
-                .as_bytes()
-                .iter()
+            offset: range.end,
+            line: 1 + subject[..range.end].matches('\n').count(),
+            column: 1 + subject[..range.end]
+                .chars()
                 .rev()
-                .position(|&b| b == b'\n')
-                .unwrap_or(end),
+                .position(|c| c == '\n')
+                .unwrap_or(subject[..range.end].chars().count()),
         };
         Span::new(start, end)
     }
@@ -1085,10 +1095,32 @@ mod tests {
         let pat = ".\n.";
         assert_eq!(
             parser(pat).parse(),
-            Ok(concat_with(span_range(pat, 0, 3), vec![
-                Ast::Class(AstClass::Dot(span_range(pat, 0, 1))),
-                lit_with('\n', span_range(pat, 1, 2)),
-                Ast::Class(AstClass::Dot(span_range(pat, 2, 3))),
+            Ok(concat_with(span_range(pat, 0..3), vec![
+                Ast::Class(AstClass::Dot(span_range(pat, 0..1))),
+                lit_with('\n', span_range(pat, 1..2)),
+                Ast::Class(AstClass::Dot(span_range(pat, 2..3))),
+            ])));
+
+        let pat = "foobar\nbaz\nquux\n";
+        assert_eq!(
+            parser(pat).parse(),
+            Ok(concat_with(span_range(pat, 0..pat.len()), vec![
+                lit_with('f', nspan(npos(0, 1, 1), npos(1, 1, 2))),
+                lit_with('o', nspan(npos(1, 1, 2), npos(2, 1, 3))),
+                lit_with('o', nspan(npos(2, 1, 3), npos(3, 1, 4))),
+                lit_with('b', nspan(npos(3, 1, 4), npos(4, 1, 5))),
+                lit_with('a', nspan(npos(4, 1, 5), npos(5, 1, 6))),
+                lit_with('r', nspan(npos(5, 1, 6), npos(6, 1, 7))),
+                lit_with('\n', nspan(npos(6, 1, 7), npos(7, 2, 1))),
+                lit_with('b', nspan(npos(7, 2, 1), npos(8, 2, 2))),
+                lit_with('a', nspan(npos(8, 2, 2), npos(9, 2, 3))),
+                lit_with('z', nspan(npos(9, 2, 3), npos(10, 2, 4))),
+                lit_with('\n', nspan(npos(10, 2, 4), npos(11, 3, 1))),
+                lit_with('q', nspan(npos(11, 3, 1), npos(12, 3, 2))),
+                lit_with('u', nspan(npos(12, 3, 2), npos(13, 3, 3))),
+                lit_with('u', nspan(npos(13, 3, 3), npos(14, 3, 4))),
+                lit_with('x', nspan(npos(14, 3, 4), npos(15, 3, 5))),
+                lit_with('\n', nspan(npos(15, 3, 5), npos(16, 4, 1))),
             ])));
     }
 
@@ -1589,7 +1621,7 @@ mod tests {
             kind: AstErrorKind::FlagUnrecognized { flag: 'a' },
         }));
         assert_eq!(parser("☃").parse_flag(), Err(AstError {
-            span: span_with(0, "☃"),
+            span: span_range("☃", 0..3),
             kind: AstErrorKind::FlagUnrecognized { flag: '☃' },
         }));
     }
@@ -1629,7 +1661,7 @@ mod tests {
         assert_eq!(
             parser(r"☃").parse_primitive(),
             Ok(Primitive::Literal(AstLiteral {
-                span: span_with(0, "☃"),
+                span: span_range("☃", 0..3),
                 kind: AstLiteralKind::Verbatim,
                 c: '☃',
             })));
