@@ -25,6 +25,9 @@ impl error::Error for AstError {
     fn description(&self) -> &str {
         use self::AstErrorKind::*;
         match self.kind {
+            CountedRepetitionUnclosed => "unclosed counted repetition",
+            DecimalEmpty => "empty decimal literal",
+            DecimalInvalid => "invalid decimal literal",
             EscapeHexEmpty => "empty hexadecimal literal",
             EscapeHexInvalid => "invalid hexadecimal literal",
             EscapeHexInvalidDigit{..} => "invalid hexadecimal digit",
@@ -48,6 +51,15 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::AstErrorKind::*;
         match self.kind {
+            CountedRepetitionUnclosed => {
+                write!(f, "unclosed counted repetition")
+            }
+            DecimalEmpty => {
+                write!(f, "decimal literal empty")
+            }
+            DecimalInvalid => {
+                write!(f, "decimal literal invalid")
+            }
             EscapeHexEmpty => {
                 write!(f, "hexadecimal literal empty")
             }
@@ -107,6 +119,12 @@ impl AstError {
 /// The type of an error that occurred while building an AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstErrorKind {
+    /// An opening { was found with no corresponding closing }.
+    CountedRepetitionUnclosed,
+    /// An empty decimal number was given where one was expected.
+    DecimalEmpty,
+    /// An invalid decimal number was given where one was expected.
+    DecimalInvalid,
     /// A bracketed hex literal was empty.
     EscapeHexEmpty,
     /// A bracketed hex literal did not correspond to a Unicode scalar value.
@@ -622,11 +640,21 @@ pub struct AstRepetition {
     /// The span of this operation.
     pub span: Span,
     /// The actual operation.
-    pub kind: AstRepetitionKind,
+    pub op: AstRepetitionOp,
     /// Whether this operation was applied greedily or not.
     pub greedy: bool,
     /// The regular expression under repetition.
     pub ast: Box<Ast>,
+}
+
+/// The repetition operator itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AstRepetitionOp {
+    /// The span of this operator. This includes things like `+`, `*?` and
+    /// `{m,n}`.
+    pub span: Span,
+    /// The type of operation.
+    pub kind: AstRepetitionKind,
 }
 
 /// The kind of a repetition operator.
@@ -692,6 +720,9 @@ pub enum AstGroupKind {
 }
 
 /// A capture name.
+///
+/// This corresponds to the name itself between the angle brackets in, e.g.,
+/// `(?P<foo>expr)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstCaptureName {
     /// The span of this capture name.
