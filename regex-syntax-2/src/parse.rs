@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::mem;
 use std::result;
 
 use ast::*;
@@ -78,6 +79,11 @@ pub struct Parser<'p> {
     cline: Cell<usize>,
     /// The current column number of the parser.
     ccolumn: Cell<usize>,
+    /// Whether whitespace should be ignored. When enabled, comments are
+    /// also permitted.
+    ignore_space: Cell<bool>,
+    /// A list of comments, in order of appearance.
+    comments: RefCell<Vec<AstComment>>,
     /// A stack of sub-expressions.
     stack: RefCell<Vec<State>>,
 }
@@ -89,6 +95,8 @@ enum State {
         concat: AstConcat,
         /// The group that has been opened. Its sub-AST is always empty.
         group: AstGroup,
+        /// Whether this group has the `x` flag enabled or not.
+        ignore_space: bool,
     },
     /// This state is pushed whenever a new alternation branch is found. If
     /// an alternation branch is found and this state is at the top of the
@@ -114,6 +122,8 @@ impl<'p> Parser<'p> {
             coffset: Cell::new(0),
             cline: Cell::new(1),
             ccolumn: Cell::new(1),
+            ignore_space: Cell::new(false),
+            comments: RefCell::new(vec![]),
             stack: RefCell::new(vec![]),
         }
     }
@@ -138,6 +148,11 @@ impl<'p> Parser<'p> {
     /// The column number starts at `1` and is reset whenever a `\n` is seen.
     fn column(&self) -> usize {
         self.ccolumn.get()
+    }
+
+    /// Return whether the parser should ignore whitespace or not.
+    fn ignore_space(&self) -> bool {
+        self.ignore_space.get()
     }
 
     /// Return the character at the current position of the parser.
@@ -184,10 +199,53 @@ impl<'p> Parser<'p> {
         }
     }
 
+    /// If the `x` flag is enabled (i.e., whitespace insensitivity with
+    /// comments), then this will advance the parser through all whitespace
+    /// and comments to the next non-whitespace non-comment byte.
+    ///
+    /// If the `x` flag is disabled, then this is a no-op.
+    ///
+    /// This should be used selectively throughout the parser where
+    /// arbitrary whitespace is permitted when the `x` flag is enabled. For
+    /// example, `{   5  , 6}` is equivalent to `{5,6}`, but
+    /// `\p{G r e e k}` is not equivalent to `\p{Greek}`.
+    fn bump_space(&self) {
+        if !self.ignore_space() {
+            return;
+        }
+        while !self.is_eof() {
+            if self.char().is_whitespace() {
+                self.bump();
+            } else if self.char() == '#' {
+                let start = self.pos();
+                let mut comment_text = String::new();
+                self.bump();
+                while !self.is_eof() {
+                    let c = self.char();
+                    self.bump();
+                    if c == '\n' {
+                        break;
+                    }
+                    comment_text.push(c);
+                }
+                let comment = AstComment {
+                    span: Span::new(start, self.pos()),
+                    comment: comment_text,
+                };
+                self.comments.borrow_mut().push(comment);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Peek at the next character in the input without advancing the parser.
     ///
     /// If the input has been exhausted, then this returns `None`.
     fn peek(&self) -> Option<char> {
+        if self.is_eof() {
+            return None;
+        }
         self.pattern[self.offset() + self.char().len_utf8()..].chars().next()
     }
 
@@ -318,14 +376,26 @@ impl<'p> Parser<'p> {
         assert_eq!(self.char(), '(');
         match try!(self.parse_group()) {
             Either::Left(set) => {
+                let ignore = set.flags.flag_state(AstFlag::IgnoreWhitespace);
+                if let Some(v) = ignore {
+                    self.ignore_space.set(v);
+                }
+
                 concat.asts.push(Ast::Flags(set));
                 Ok(concat)
             }
             Either::Right(group) => {
+                let old_ignore_space = self.ignore_space();
+                let new_ignore_space = group
+                    .flags()
+                    .and_then(|f| f.flag_state(AstFlag::IgnoreWhitespace))
+                    .unwrap_or(false);
                 self.state_push(State::Group {
                     concat: concat,
                     group: group,
+                    ignore_space: old_ignore_space,
                 });
+                self.ignore_space.set(new_ignore_space);
                 Ok(AstConcat {
                     span: self.span(),
                     asts: vec![],
@@ -345,15 +415,15 @@ impl<'p> Parser<'p> {
     /// returned.
     fn pop_group(&self, mut group_concat: AstConcat) -> Result<AstConcat> {
         assert_eq!(self.char(), ')');
-        let (mut prior_concat, mut group, alt) =
+        let (mut prior_concat, mut group, ignore_space, alt) =
             match self.state_pop() {
-                Some(State::Group { concat, group }) => {
-                    (concat, group, None)
+                Some(State::Group { concat, group, ignore_space }) => {
+                    (concat, group, ignore_space, None)
                 }
                 Some(State::Alternation(alt)) => {
                     match self.state_pop() {
-                        Some(State::Group { concat, group }) => {
-                            (concat, group, Some(alt))
+                        Some(State::Group { concat, group, ignore_space }) => {
+                            (concat, group, ignore_space, Some(alt))
                         }
                         _ => return Err(AstError {
                             span: self.span_char(),
@@ -366,6 +436,7 @@ impl<'p> Parser<'p> {
                     kind: AstErrorKind::GroupUnopened,
                 }),
             };
+        self.ignore_space.set(ignore_space);
         group_concat.span.end = self.pos();
         self.bump();
         group.span.end = self.pos();
@@ -428,6 +499,16 @@ impl<'p> Parser<'p> {
 }
 
 impl<'s> Parser<'s> {
+    /// Parse the regular expression and return an AST tagged
+    /// with comments.
+    fn parse_with_comments(&self) -> Result<AstWithComments> {
+        let ast = try!(self.parse());
+        Ok(AstWithComments {
+            ast: ast,
+            comments: mem::replace(&mut *self.comments.borrow_mut(), vec![]),
+        })
+    }
+
     /// Parse the regular expression.
     fn parse(&self) -> Result<Ast> {
         if self.is_eof() {
@@ -445,7 +526,11 @@ impl<'s> Parser<'s> {
         // x 2. Repetition operators. Requires looking at current concat.
         //   3. Implement support for (?x).
         //   4. Character classes, including nested classes. Joy.
-        while !self.is_eof() {
+        loop {
+            self.bump_space();
+            if self.is_eof() {
+                break;
+            }
             match self.char() {
                 '(' => concat = try!(self.push_group(concat)),
                 ')' => concat = try!(self.pop_group(concat)),
@@ -1088,6 +1173,58 @@ mod tests {
             kind: AstGroupKind::CaptureIndex,
             ast: Box::new(ast),
         })
+    }
+
+    #[test]
+    fn parse_comments() {
+        let pat = "(?x)
+# This is comment 1.
+foo # This is comment 2.
+  # This is comment 3.
+bar
+# This is comment 4.";
+        let astc = parser(pat).parse_with_comments().unwrap();
+        assert_eq!(
+            astc.ast,
+            concat_with(span_range(pat, 0..pat.len()), vec![
+                Ast::Flags(AstSetFlags {
+                    span: span_range(pat, 0..4),
+                    flags: AstFlags {
+                        span: span_range(pat, 2..3),
+                        items: vec![
+                            AstFlagsItem {
+                                span: span_range(pat, 2..3),
+                                kind: AstFlagsItemKind::Flag(
+                                    AstFlag::IgnoreWhitespace),
+                            },
+                        ],
+                    },
+                }),
+                lit_with('f', span_range(pat, 26..27)),
+                lit_with('o', span_range(pat, 27..28)),
+                lit_with('o', span_range(pat, 28..29)),
+                lit_with('b', span_range(pat, 74..75)),
+                lit_with('a', span_range(pat, 75..76)),
+                lit_with('r', span_range(pat, 76..77)),
+            ]));
+        assert_eq!(astc.comments, vec![
+            AstComment {
+                span: span_range(pat, 5..26),
+                comment: " This is comment 1.".to_string(),
+            },
+            AstComment {
+                span: span_range(pat, 30..51),
+                comment: " This is comment 2.".to_string(),
+            },
+            AstComment {
+                span: span_range(pat, 53..74),
+                comment: " This is comment 3.".to_string(),
+            },
+            AstComment {
+                span: span_range(pat, 78..98),
+                comment: " This is comment 4.".to_string(),
+            },
+        ]);
     }
 
     #[test]

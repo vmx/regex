@@ -262,9 +262,10 @@ pub struct AstWithComments {
 /// enabled.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstComment {
-    /// The span of this comment, including the beginning `#`.
+    /// The span of this comment, including the beginning `#` and ending `\n`.
     pub span: Span,
-    /// The comment text, starting with the first character following the `#`.
+    /// The comment text, starting with the first character following the `#`
+    /// and ending with the last character preceding the `\n`.
     pub comment: String,
 }
 
