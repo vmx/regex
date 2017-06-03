@@ -25,6 +25,8 @@ impl error::Error for AstError {
     fn description(&self) -> &str {
         use self::AstErrorKind::*;
         match self.kind {
+            ClassIllegal => "illegal item found in character class",
+            ClassUnclosed => "unclosed character class",
             CountedRepetitionUnclosed => "unclosed counted repetition",
             DecimalEmpty => "empty decimal literal",
             DecimalInvalid => "invalid decimal literal",
@@ -51,6 +53,12 @@ impl fmt::Display for AstError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::AstErrorKind::*;
         match self.kind {
+            ClassIllegal => {
+                write!(f, "illegal item found in character class")
+            }
+            ClassUnclosed => {
+                write!(f, "unclosed character class")
+            }
             CountedRepetitionUnclosed => {
                 write!(f, "unclosed counted repetition")
             }
@@ -119,7 +127,11 @@ impl AstError {
 /// The type of an error that occurred while building an AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstErrorKind {
-    /// An opening { was found with no corresponding closing }.
+    /// An invalid escape sequence was found in a character class set.
+    ClassIllegal,
+    /// An opening `[` was found with no corresponding closing `]`.
+    ClassUnclosed,
+    /// An opening `{` was found with no corresponding closing `}`.
     CountedRepetitionUnclosed,
     /// An empty decimal number was given where one was expected.
     DecimalEmpty,
@@ -294,8 +306,10 @@ pub enum Ast {
     Empty(Span),
     /// A single character literal, which includes escape sequences.
     Literal(AstLiteral),
-    /// A single character class. This includes all forms of character classes,
-    /// e.g., `\d`, `\pN`, `[a-z]` and `[[:alpha:]]`.
+    /// The "any character" class.
+    Dot(Span),
+    /// A single character class. This includes all forms of character classes
+    /// except for `.`. e.g., `\d`, `\pN`, `[a-z]` and `[[:alpha:]]`.
     Class(AstClass),
     /// A single zero-width assertion.
     Assertion(AstAssertion),
@@ -317,6 +331,7 @@ impl Ast {
         match *self {
             Ast::Empty(ref span) => span,
             Ast::Literal(ref x) => &x.span,
+            Ast::Dot(ref span) => span,
             Ast::Class(ref x) => x.span(),
             Ast::Assertion(ref x) => &x.span,
             Ast::Repetition(ref x) => &x.span,
@@ -413,8 +428,6 @@ pub enum AstLiteralKind {
 /// A single character class expression.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AstClass {
-    /// The special "any character" class, i.e., `.`.
-    Dot(Span),
     /// A perl character class, e.g., `\d` or `\W`.
     Perl(AstClassPerl),
     /// An ASCII character class, e.g., `[[:alnum:]]` or `[[:punct:]]`.
@@ -422,7 +435,7 @@ pub enum AstClass {
     /// A Unicode character class, e.g., `\pL` or `\p{Greek}`.
     Unicode(AstClassUnicode),
     /// A character class set, which may contain zero or more character ranges
-    /// and/or zero or more nested classes. e.g., `[a-zA-Z]`.
+    /// and/or zero or more nested classes. e.g., `[a-zA-Z\pL]`.
     Set(AstClassSet),
 }
 
@@ -430,7 +443,6 @@ impl AstClass {
     /// Return the span of this character class.
     pub fn span(&self) -> &Span {
         match *self {
-            AstClass::Dot(ref span) => span,
             AstClass::Perl(ref x) => &x.span,
             AstClass::Ascii(ref x) => &x.span,
             AstClass::Unicode(ref x) => &x.span,
@@ -507,6 +519,36 @@ pub enum AstClassAsciiKind {
     Xdigit,
 }
 
+impl AstClassAsciiKind {
+    /// Return the corresponding AstClassAsciiKind variant for the given name.
+    ///
+    /// The name given should correspond to the lowercase version of the
+    /// variant name. e.g., `cntrl` is the name for `AstClassAsciiKind::Cntrl`.
+    ///
+    /// If no variant with the corresponding name exists, then `None` is
+    /// returned.
+    pub fn from_name(name: &str) -> Option<AstClassAsciiKind> {
+        use self::AstClassAsciiKind::*;
+        match name {
+            "alnum" => Some(Alnum),
+            "alpha" => Some(Alpha),
+            "ascii" => Some(Ascii),
+            "blank" => Some(Blank),
+            "cntrl" => Some(Cntrl),
+            "digit" => Some(Digit),
+            "graph" => Some(Graph),
+            "lower" => Some(Lower),
+            "print" => Some(Print),
+            "punct" => Some(Punct),
+            "space" => Some(Space),
+            "upper" => Some(Upper),
+            "word" => Some(Word),
+            "xdigit" => Some(Xdigit),
+            _ => None,
+        }
+    }
+}
+
 /// A Unicode character class.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AstClassUnicode {
@@ -538,8 +580,59 @@ pub struct AstClassSet {
     /// Whether this class is negated or not. e.g., `[a]` is not negated but
     /// `[^a]` is.
     pub negated: bool,
-    /// The sequence of items that make up this set.
+    /// The top-level op of this set.
+    pub op: AstClassSetOp,
+}
+
+/// An operation inside a character class set.
+///
+/// An operation is either a union of many things, or a binary operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AstClassSetOp {
+    /// A union of items in a class. A union may contain a single item.
+    Union(AstClassSetUnion),
+    /// A single binary operation (i.e., &&, -- or ~~).
+    BinaryOp(AstClassSetBinaryOp),
+}
+
+impl AstClassSetOp {
+    /// Return the span of this character class set operation.
+    pub fn span(&self) -> &Span {
+        match *self {
+            AstClassSetOp::Union(ref x) => &x.span,
+            AstClassSetOp::BinaryOp(ref x) => &x.span,
+        }
+    }
+}
+
+/// A union of items inside a character class set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AstClassSetUnion {
+    /// The span of the items in this operation. e.g., the `a-z0-9` in
+    /// `[^a-z0-9]`
+    pub span: Span,
+    /// The sequence of items that make up this union.
     pub items: Vec<AstClassSetItem>,
+}
+
+impl AstClassSetUnion {
+    /// Push a new item in this union.
+    ///
+    /// The ending position of this union's span is updated to the ending
+    /// position of the span of the item given. If the union is empty, then
+    /// the starting position of this union is set to the starting position
+    /// of this item.
+    ///
+    /// In other words, if you only use this method to add items to a union
+    /// and you set the spans on each item correctly, then you should never
+    /// need to adjust the span of the union directly.
+    pub fn push(&mut self, item: AstClassSetItem) {
+        if self.items.is_empty() {
+            self.span.start = item.span().start;
+        }
+        self.span.end = item.span().end;
+        self.items.push(item);
+    }
 }
 
 /// A single component of a character class set.
@@ -551,8 +644,6 @@ pub enum AstClassSetItem {
     Range(AstClassSetRange),
     /// A nested character class.
     Class(Box<AstClass>),
-    /// A Unicode character class set operation. e.g., `[\pL--a]`.
-    Op(AstClassSetOp),
 }
 
 impl AstClassSetItem {
@@ -562,7 +653,6 @@ impl AstClassSetItem {
             AstClassSetItem::Literal(ref x) => &x.span,
             AstClassSetItem::Range(ref x) => &x.span,
             AstClassSetItem::Class(ref x) => x.span(),
-            AstClassSetItem::Op(ref x) => &x.span,
         }
     }
 }
@@ -580,15 +670,15 @@ pub struct AstClassSetRange {
 
 /// A Unicode character class set operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AstClassSetOp {
-    /// The span of this operation.
+pub struct AstClassSetBinaryOp {
+    /// The span of this operation. e.g., the `a-z--[h-p]` in `[a-z--h-p]`.
     pub span: Span,
     /// The type of this set operation.
-    pub kind: AstClassSetOpKind,
+    pub kind: AstClassSetBinaryOpKind,
     /// The left hand side of the operation.
-    pub class1: Box<AstClass>,
+    pub lhs: Box<AstClassSetOp>,
     /// The right hand side of the operation.
-    pub class2: Box<AstClass>,
+    pub rhs: Box<AstClassSetOp>,
 }
 
 /// The type of a Unicode character class set operation.
@@ -596,8 +686,8 @@ pub struct AstClassSetOp {
 /// Note that this doesn't explicitly represent union since there is no
 /// explicit union operator. Concatenation inside a character class corresponds
 /// to the union operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AstClassSetOpKind {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AstClassSetBinaryOpKind {
     /// The intersection of two sets, e.g., `\pN&&[a-z]`.
     Intersection,
     /// The difference of two sets, e.g., `\pN--[0-9]`.
