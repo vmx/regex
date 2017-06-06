@@ -45,6 +45,7 @@ impl error::Error for AstError {
             GroupNameUnexpectedEof => "unclosed capture group name",
             GroupUnclosed => "unclosed group",
             GroupUnopened => "unopened group",
+            NestLimitExceeded(_) => "nest limit exceeded",
         }
     }
 }
@@ -113,6 +114,10 @@ impl fmt::Display for AstError {
             }
             GroupUnopened => {
                 write!(f, "unopened group")
+            }
+            NestLimitExceeded(limit) => {
+                write!(f, "exceed the maximum number of \
+                           nested parentheses/brackets ({})", limit)
             }
         }
     }
@@ -194,6 +199,9 @@ pub enum AstErrorKind {
     GroupUnclosed,
     /// An unopened group, e.g., `ab)`.
     GroupUnopened,
+    /// The nest limit was exceeded. The limit stored here is the limit
+    /// configured in the parser.
+    NestLimitExceeded(u32),
 }
 
 /// Span represents the position information of a single AST item.
@@ -304,21 +312,21 @@ pub struct AstComment {
 pub enum Ast {
     /// An empty regex that matches exactly the empty string.
     Empty(Span),
+    /// A set of flags, e.g., `(?is)`.
+    Flags(AstSetFlags),
     /// A single character literal, which includes escape sequences.
     Literal(AstLiteral),
     /// The "any character" class.
     Dot(Span),
+    /// A single zero-width assertion.
+    Assertion(AstAssertion),
     /// A single character class. This includes all forms of character classes
     /// except for `.`. e.g., `\d`, `\pN`, `[a-z]` and `[[:alpha:]]`.
     Class(AstClass),
-    /// A single zero-width assertion.
-    Assertion(AstAssertion),
     /// A repetition operator applied to an arbitrary regular expression.
     Repetition(AstRepetition),
     /// A grouped regular expression.
     Group(AstGroup),
-    /// A set of flags, e.g., `(?is)`.
-    Flags(AstSetFlags),
     /// An alternation of regular expressions.
     Alternation(AstAlternation),
     /// A concatenation of regular expressions.
@@ -940,6 +948,110 @@ impl fmt::Display for AstFlag {
             SwapGreed => write!(f, "U"),
             Unicode => write!(f, "u"),
             IgnoreWhitespace => write!(f, "x"),
+        }
+    }
+}
+
+/// Returns an error if the given AST exceeds the given depth limit.
+pub fn error_if_nested(
+    ast: &Ast,
+    limit: u32,
+    depth: u32,
+) -> Result<(), AstError> {
+    if depth >= limit {
+        return Err(AstError {
+            span: *ast.span(),
+            kind: AstErrorKind::NestLimitExceeded(limit),
+        });
+    }
+    match *ast {
+        Ast::Empty(_)
+        | Ast::Flags(_)
+        | Ast::Literal(_)
+        | Ast::Dot(_)
+        | Ast::Assertion(_) => {
+            Ok(())
+        }
+        Ast::Class(ref cls) => {
+            error_if_nested_class(cls, limit, depth)
+        }
+        Ast::Repetition(AstRepetition { ref ast, .. }) => {
+            error_if_nested(ast, limit, depth.checked_add(1).unwrap())
+        }
+        Ast::Group(AstGroup { ref ast, .. }) => {
+            error_if_nested(ast, limit, depth.checked_add(1).unwrap())
+        }
+        Ast::Alternation(AstAlternation { ref asts, .. }) => {
+            let depth = depth.checked_add(1).unwrap();
+            for ast in asts {
+                try!(error_if_nested(ast, limit, depth));
+            }
+            Ok(())
+        }
+        Ast::Concat(AstConcat { ref asts, .. }) => {
+            let depth = depth.checked_add(1).unwrap();
+            for ast in asts {
+                try!(error_if_nested(ast, limit, depth));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Returns an error if the given AST class exceeds the given depth limit.
+fn error_if_nested_class(
+    class: &AstClass,
+    limit: u32,
+    depth: u32,
+) -> Result<(), AstError> {
+    if depth >= limit {
+        return Err(AstError {
+            span: *class.span(),
+            kind: AstErrorKind::NestLimitExceeded(limit),
+        });
+    }
+    match *class {
+        AstClass::Perl(_)
+        | AstClass::Ascii(_)
+        | AstClass::Unicode(_) => Ok(()),
+        AstClass::Set(AstClassSet { ref op, .. }) => {
+            error_if_nested_class_op(op, limit, depth)
+        }
+    }
+}
+
+fn error_if_nested_class_op(
+    op: &AstClassSetOp,
+    limit: u32,
+    depth: u32,
+) -> Result<(), AstError> {
+    if depth >= limit {
+        return Err(AstError {
+            span: *op.span(),
+            kind: AstErrorKind::NestLimitExceeded(limit),
+        });
+    }
+    match *op {
+        AstClassSetOp::Union(AstClassSetUnion { ref items, .. }) => {
+            for item in items {
+                match *item {
+                    AstClassSetItem::Literal(_)
+                    | AstClassSetItem::Range(_) => {}
+                    AstClassSetItem::Class(ref cls) => {
+                        let depth = depth.checked_add(1).unwrap();
+                        try!(error_if_nested_class(cls, limit, depth));
+                    }
+                }
+            }
+            Ok(())
+        }
+        AstClassSetOp::BinaryOp(AstClassSetBinaryOp {
+            ref lhs, ref rhs, ..
+        }) => {
+            let depth = depth.checked_add(1).unwrap();
+            try!(error_if_nested_class_op(lhs, limit, depth));
+            try!(error_if_nested_class_op(rhs, limit, depth));
+            Ok(())
         }
     }
 }

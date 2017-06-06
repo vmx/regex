@@ -126,6 +126,9 @@ fn is_capture_char(c: char, first: bool) -> bool {
 pub struct Parser<'p> {
     /// The full regular expression provided by the user.
     pattern: &'p str,
+    /// The maximum number of open parens/brackets allowed. If the parser
+    /// exceeds this number, then an error is returned.
+    nest_limit: u32,
     /// The current position of the parser.
     pos: Cell<Position>,
     /// Whether whitespace should be ignored. When enabled, comments are
@@ -199,15 +202,33 @@ impl ClassState {
 
 impl<'p> Parser<'p> {
     /// Create a new parser for the given regular expression.
+    ///
+    /// The parser can be run with either the `parse` or `parse_with_comments`
+    /// methods. The parse methods return an abstract syntax tree.
     pub fn new(pattern: &str) -> Parser {
         Parser {
             pattern: pattern,
+            nest_limit: 100,
             pos: Cell::new(Position { offset: 0, line: 1, column: 1 }),
             ignore_space: Cell::new(false),
             comments: RefCell::new(vec![]),
             stack_group: RefCell::new(vec![]),
             stack_class: RefCell::new(vec![]),
         }
+    }
+
+    /// Set the nesting limit for this parser.
+    ///
+    /// The nesting limit controls how deep the abstract syntax tree is allowed
+    /// to be. If the AST exceeds the given limit (e.g., with too many nested
+    /// groups), then an error is returned by the parser.
+    ///
+    /// Note that a nest limit of `0` will return a nest limit error for every
+    /// regular expression. A nest limit of `1` allows `a` but not `(a)` or
+    /// `a+`.
+    pub fn nest_limit(&mut self, limit: u32) -> &mut Parser<'p> {
+        self.nest_limit = limit;
+        self
     }
 
     /// Return the current offset of the parser.
@@ -702,34 +723,19 @@ impl<'p> Parser<'p> {
 }
 
 impl<'s> Parser<'s> {
-    /// Parse the regular expression and return an AST tagged
-    /// with comments.
-    fn parse_with_comments(&self) -> Result<AstWithComments> {
-        let ast = try!(self.parse());
-        Ok(AstWithComments {
-            ast: ast,
-            comments: mem::replace(&mut *self.comments.borrow_mut(), vec![]),
-        })
+    /// Parse the regular expression into an abstract syntax tree.
+    pub fn parse(&self) -> Result<Ast> {
+        self.parse_with_comments().map(|astc| astc.ast)
     }
 
-    /// Parse the regular expression.
-    fn parse(&self) -> Result<Ast> {
-        if self.is_eof() {
-            return Ok(Ast::Empty(self.span()));
-        }
+    /// Parse the regular expression and return an abstract syntax tree with
+    /// all of the comments found in the pattern.
+    pub fn parse_with_comments(&self) -> Result<AstWithComments> {
+        assert_eq!(self.offset(), 0, "parser can only be used once");
         let mut concat = AstConcat {
             span: self.span(),
             asts: vec![],
         };
-        // BREADCRUMBS:
-        //
-        // Three key things left to do:
-        //
-        // x 1. Alternations (mostly done at this point with parser state).
-        // x 2. Repetition operators. Requires looking at current concat.
-        // x 3. Implement support for (?x).
-        // x 4. Counted repetition operators.
-        //   5. Character classes, including nested classes. Joy.
         loop {
             self.bump_space();
             if self.is_eof() {
@@ -761,7 +767,12 @@ impl<'s> Parser<'s> {
                 _ => concat.asts.push(try!(self.parse_primitive()).into_ast()),
             }
         }
-        self.pop_group_end(concat)
+        let ast = try!(self.pop_group_end(concat));
+        try!(error_if_nested(&ast, self.nest_limit, 0));
+        Ok(AstWithComments {
+            ast: ast,
+            comments: mem::replace(&mut *self.comments.borrow_mut(), vec![]),
+        })
     }
 
     /// Parses an uncounted repetition operation. An uncounted repetition
@@ -864,7 +875,7 @@ impl<'s> Parser<'s> {
         }
 
         let mut greedy = true;
-        if self.bump() && self.char() == '?' {
+        if self.bump_and_bump_space() && self.char() == '?' {
             greedy = false;
             self.bump();
         }
@@ -1337,7 +1348,8 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// Parse a decimal number into a u32.
+    /// Parse a decimal number into a u32 while trimming leading and trailing
+    /// whitespace.
     ///
     /// This expects the parser to be positioned at the first position where
     /// a decimal digit could occur. This will advance the parser to the byte
@@ -1346,11 +1358,17 @@ impl<'s> Parser<'s> {
     /// If no decimal digit could be found or if there was a problem parsing
     /// the complete set of digits into a u32, then an error is returned.
     fn parse_decimal(&self) -> Result<u32> {
+        while !self.is_eof() && self.char().is_whitespace() {
+            self.bump();
+        }
         let start = self.pos();
         while !self.is_eof() && '0' <= self.char() && self.char() <= '9' {
             self.bump();
         }
         let span = Span::new(start, self.pos());
+        while !self.is_eof() && self.char().is_whitespace() {
+            self.bump();
+        }
         let digits = &self.pattern[span.start.offset..span.end.offset];
         if digits.is_empty() {
             return Err(AstError {
@@ -1779,6 +1797,15 @@ mod tests {
         lit_with(c, span(start..start + c.len_utf8()))
     }
 
+    /// Create a punctuation literal starting at the given position.
+    fn punct_lit(c: char, span: Span) -> Ast {
+        Ast::Literal(AstLiteral {
+            span: span,
+            kind: AstLiteralKind::Punctuation,
+            c: c,
+        })
+    }
+
     /// Create a verbatim literal with the given span.
     fn lit_with(c: char, span: Span) -> Ast {
         Ast::Literal(AstLiteral {
@@ -1847,6 +1874,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_nest_limit() {
+        assert_eq!(
+            parser("").nest_limit(0).parse(),
+            Err(AstError {
+                span: span(0..0),
+                kind: AstErrorKind::NestLimitExceeded(0),
+            }));
+        assert_eq!(
+            parser("").nest_limit(1).parse(),
+            Ok(Ast::Empty(span(0..0))));
+        assert_eq!(
+            parser("a").nest_limit(0).parse(),
+            Err(AstError {
+                span: span(0..1),
+                kind: AstErrorKind::NestLimitExceeded(0),
+            }));
+        assert_eq!(
+            parser("a").nest_limit(1).parse(),
+            Ok(lit('a', 0)));
+        assert_eq!(
+            parser("((()))").nest_limit(0).parse(),
+            Err(AstError {
+                span: span(0..6),
+                kind: AstErrorKind::NestLimitExceeded(0),
+            }));
+        assert_eq!(
+            parser("((()))").nest_limit(1).parse(),
+            Err(AstError {
+                span: span(1..5),
+                kind: AstErrorKind::NestLimitExceeded(1),
+            }));
+        assert_eq!(
+            parser("((()))").nest_limit(2).parse(),
+            Err(AstError {
+                span: span(2..4),
+                kind: AstErrorKind::NestLimitExceeded(2),
+            }));
+        assert_eq!(
+            parser("((()))").nest_limit(3).parse(),
+            Err(AstError {
+                span: span(3..3),
+                kind: AstErrorKind::NestLimitExceeded(3),
+            }));
+        assert_eq!(
+            parser("ab+").nest_limit(2).parse(),
+            Err(AstError {
+                span: span(1..2),
+                kind: AstErrorKind::NestLimitExceeded(2),
+            }));
+        assert_eq!(
+            parser("[ab[cd]]").nest_limit(1).parse(),
+            Err(AstError {
+                span: span(3..7),
+                kind: AstErrorKind::NestLimitExceeded(1),
+            }));
+    }
+
+    #[test]
     fn parse_comments() {
         let pat = "(?x)
 # This is comment 1.
@@ -1891,6 +1976,28 @@ bar
         assert_eq!(
             parser("]").parse(),
             Ok(lit(']', 0)));
+        assert_eq!(
+            parser(r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~").parse(),
+            Ok(concat(0..36, vec![
+                punct_lit('\\', span(0..2)),
+                punct_lit('.', span(2..4)),
+                punct_lit('+', span(4..6)),
+                punct_lit('*', span(6..8)),
+                punct_lit('?', span(8..10)),
+                punct_lit('(', span(10..12)),
+                punct_lit(')', span(12..14)),
+                punct_lit('|', span(14..16)),
+                punct_lit('[', span(16..18)),
+                punct_lit(']', span(18..20)),
+                punct_lit('{', span(20..22)),
+                punct_lit('}', span(22..24)),
+                punct_lit('^', span(24..26)),
+                punct_lit('$', span(26..28)),
+                punct_lit('#', span(28..30)),
+                punct_lit('&', span(30..32)),
+                punct_lit('-', span(32..34)),
+                punct_lit('~', span(34..36)),
+            ])));
     }
 
     #[test]
@@ -2264,6 +2371,43 @@ bar
                 }),
                 lit('c', 5),
             ])));
+
+        assert_eq!(
+            parser(r"{ 5 }").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..5),
+                op: AstRepetitionOp {
+                    span: span(0..5),
+                    kind: AstRepetitionKind::Range(
+                        AstRepetitionRange::Exactly(5)),
+                },
+                greedy: true,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
+        assert_eq!(
+            parser(r"{ 5 , 9 }").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..9),
+                op: AstRepetitionOp {
+                    span: span(0..9),
+                    kind: AstRepetitionKind::Range(
+                        AstRepetitionRange::Bounded(5, 9)),
+                },
+                greedy: true,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
+        assert_eq!(
+            parser_ignore_space(r"{5,9} ?").parse(),
+            Ok(Ast::Repetition(AstRepetition {
+                span: span(0..7),
+                op: AstRepetitionOp {
+                    span: span(0..7),
+                    kind: AstRepetitionKind::Range(
+                        AstRepetitionRange::Bounded(5, 9)),
+                },
+                greedy: false,
+                ast: Box::new(Ast::Empty(span(0..0))),
+            })));
 
         assert_eq!(
             parser(r"{").parse(),
@@ -3369,6 +3513,59 @@ bar
                     union(span(7..8), vec![lit(span(7..8), 'c')]),
                 ),
             }))));
+        assert_eq!(
+            parser(r"[\^&&^]").parse(),
+            Ok(Ast::Class(AstClass::Set(AstClassSet {
+                span: span(0..7),
+                negated: false,
+                op: intersection(
+                    span(1..6),
+                    union(span(1..3), vec![
+                        AstClassSetItem::Literal(AstLiteral {
+                            span: span(1..3),
+                            kind: AstLiteralKind::Punctuation,
+                            c: '^',
+                        }),
+                    ]),
+                    union(span(5..6), vec![
+                        lit(span(5..6), '^'),
+                    ]),
+                ),
+            }))));
+        assert_eq!(
+            parser(r"[\&&&&]").parse(),
+            Ok(Ast::Class(AstClass::Set(AstClassSet {
+                span: span(0..7),
+                negated: false,
+                op: intersection(
+                    span(1..6),
+                    union(span(1..3), vec![
+                        AstClassSetItem::Literal(AstLiteral {
+                            span: span(1..3),
+                            kind: AstLiteralKind::Punctuation,
+                            c: '&',
+                        }),
+                    ]),
+                    union(span(5..6), vec![
+                        lit(span(5..6), '&'),
+                    ]),
+                ),
+            }))));
+        assert_eq!(
+            parser(r"[&&&&]").parse(),
+            Ok(Ast::Class(AstClass::Set(AstClassSet {
+                span: span(0..6),
+                negated: false,
+                op: intersection(
+                    span(1..5),
+                    intersection(
+                        span(1..3),
+                        union(span(1..1), vec![]),
+                        union(span(3..3), vec![]),
+                    ),
+                    union(span(5..5), vec![]),
+                ),
+            }))));
 
         let pat = "[☃-⛄]";
         assert_eq!(
@@ -3392,6 +3589,48 @@ bar
                     }),
                 ]),
             }))));
+
+        assert_eq!(
+            parser(r"[]]").parse(),
+            Ok(Ast::Class(AstClass::Set(AstClassSet {
+                span: span(0..3),
+                negated: false,
+                op: union(span(1..2), vec![lit(span(1..2), ']')]),
+            }))));
+        assert_eq!(
+            parser(r"[]\[]").parse(),
+            Ok(Ast::Class(AstClass::Set(AstClassSet {
+                span: span(0..5),
+                negated: false,
+                op: union(span(1..4), vec![
+                    lit(span(1..2), ']'),
+                    AstClassSetItem::Literal(AstLiteral  {
+                        span: span(2..4),
+                        kind: AstLiteralKind::Punctuation,
+                        c: '[',
+                    }),
+                ]),
+            }))));
+        assert_eq!(
+            parser(r"[\[]]").parse(),
+            Ok(concat(0..5, vec![
+                Ast::Class(AstClass::Set(AstClassSet {
+                    span: span(0..4),
+                    negated: false,
+                    op: union(span(1..3), vec![
+                        AstClassSetItem::Literal(AstLiteral  {
+                            span: span(1..3),
+                            kind: AstLiteralKind::Punctuation,
+                            c: '[',
+                        }),
+                    ]),
+                })),
+                Ast::Literal(AstLiteral {
+                    span: span(4..5),
+                    kind: AstLiteralKind::Verbatim,
+                    c: ']',
+                }),
+            ])));
 
         assert_eq!(
             parser("[").parse(),
